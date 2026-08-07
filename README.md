@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Simple RAG Chatbot chạy hoàn toàn local
 
 Ứng dụng hỏi đáp nội dung PDF bằng Retrieval-Augmented Generation (RAG). Toàn
@@ -314,6 +313,3 @@ brew services start ollama
 - [Gemma 4 trên Ollama](https://ollama.com/library/gemma4)
 - [ChatOllama trong LangChain](https://docs.langchain.com/oss/python/integrations/chat/ollama)
 - [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3)
-=======
-# SimpleRAGChatBot
->>>>>>> 8612f2da06b657ad16e5840f31e54b0c6a05edcc
