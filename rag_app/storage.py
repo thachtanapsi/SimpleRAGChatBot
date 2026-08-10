@@ -3,10 +3,41 @@
 from __future__ import annotations
 
 import sqlite3
+import re
+import unicodedata
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
+
+
+FTS_MAX_QUERY_TOKENS = 32
+FTS_TOKEN_RE = re.compile(r"\w+", flags=re.UNICODE)
+
+
+def normalise_fts_text(text: str) -> str:
+    """Bỏ dấu cho lexical index; xử lý riêng đ/Đ mà Unicode NFD không tách."""
+
+    folded = text.casefold().replace("đ", "d")
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFD", folded)
+        if unicodedata.category(character) != "Mn"
+    )
+
+
+def build_fts_query(text: str) -> str:
+    """Tạo MATCH expression chỉ từ token, không nhận cú pháp FTS của người dùng."""
+
+    unique_tokens: list[str] = []
+    seen: set[str] = set()
+    for token in FTS_TOKEN_RE.findall(normalise_fts_text(text)):
+        if token not in seen:
+            unique_tokens.append(token)
+            seen.add(token)
+        if len(unique_tokens) == FTS_MAX_QUERY_TOKENS:
+            break
+    return " OR ".join(f'"{token}"' for token in unique_tokens)
 
 
 def utc_now() -> str:
@@ -74,7 +105,8 @@ class SQLiteStorage:
                     parent_id TEXT NOT NULL REFERENCES parents(id) ON DELETE CASCADE,
                     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
                     page INTEGER NOT NULL,
-                    start_index INTEGER NOT NULL
+                    start_index INTEGER NOT NULL,
+                    text TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_children_document
@@ -105,10 +137,45 @@ class SQLiteStorage:
                 );
                 """
             )
+            child_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(children)")
+            }
+            if "text" not in child_columns:
+                db.execute("ALTER TABLE children ADD COLUMN text TEXT NOT NULL DEFAULT ''")
+            try:
+                db.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS child_fts USING fts5(
+                        child_id UNINDEXED,
+                        parent_id UNINDEXED,
+                        document_id UNINDEXED,
+                        text,
+                        tokenize='unicode61 remove_diacritics 2'
+                    )
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                raise RuntimeError("SQLite hiện tại không hỗ trợ FTS5") from exc
+            db.execute(
+                "INSERT INTO app_meta(key, value) VALUES ('schema_version', '2') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
 
     def healthcheck(self) -> bool:
         with self.connect() as db:
             return db.execute("SELECT 1").fetchone()[0] == 1
+
+    def fts_healthcheck(self) -> bool:
+        try:
+            with self.connect() as db:
+                db.execute("SELECT count(*) FROM child_fts").fetchone()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def fts_count(self) -> int:
+        with self.connect() as db:
+            return int(db.execute("SELECT count(*) FROM child_fts").fetchone()[0])
 
     def reset_interrupted_jobs(self) -> int:
         with self.connect() as db:
@@ -211,6 +278,7 @@ class SQLiteStorage:
     ) -> None:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM child_fts WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM children WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM parents WHERE document_id=?", (document_id,))
             db.executemany(
@@ -219,9 +287,17 @@ class SQLiteStorage:
                 parents,
             )
             db.executemany(
-                "INSERT INTO children(id, parent_id, document_id, page, start_index) "
-                "VALUES (:id, :parent_id, :document_id, :page, :start_index)",
+                "INSERT INTO children(id, parent_id, document_id, page, start_index, text) "
+                "VALUES (:id, :parent_id, :document_id, :page, :start_index, :text)",
                 children,
+            )
+            db.executemany(
+                "INSERT INTO child_fts(child_id, parent_id, document_id, text) "
+                "VALUES (:id, :parent_id, :document_id, :fts_text)",
+                [
+                    {**child, "fts_text": normalise_fts_text(str(child["text"]))}
+                    for child in children
+                ],
             )
             changed = db.execute(
                 """
@@ -243,6 +319,9 @@ class SQLiteStorage:
 
     def mark_failed(self, document_id: str, error_code: str) -> None:
         with self.connect() as db:
+            db.execute("DELETE FROM child_fts WHERE document_id=?", (document_id,))
+            db.execute("DELETE FROM children WHERE document_id=?", (document_id,))
+            db.execute("DELETE FROM parents WHERE document_id=?", (document_id,))
             db.execute(
                 "UPDATE documents SET status='failed', error=?, updated_at=? WHERE id=?",
                 (error_code[:200], utc_now(), document_id),
@@ -260,6 +339,7 @@ class SQLiteStorage:
     def requeue_document(self, document_id: str) -> None:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM child_fts WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM children WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM parents WHERE document_id=?", (document_id,))
             db.execute(
@@ -293,8 +373,31 @@ class SQLiteStorage:
             ).fetchall()
             return {row["id"]: dict(row) for row in rows}
 
+    def lexical_search(
+        self, query: str, *, k: int, document_ids: Sequence[str]
+    ) -> list[dict[str, Any]]:
+        match_query = build_fts_query(query)
+        if not match_query or not document_ids:
+            return []
+        placeholders = ",".join("?" for _ in document_ids)
+        with self.connect() as db:
+            rows = db.execute(
+                f"""
+                SELECT child_id, parent_id, document_id,
+                       bm25(child_fts) AS lexical_score
+                FROM child_fts
+                WHERE child_fts MATCH ?
+                  AND document_id IN ({placeholders})
+                ORDER BY lexical_score ASC
+                LIMIT ?
+                """,
+                (match_query, *document_ids, k),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def delete_document_rows(self, document_id: str) -> None:
         with self.connect() as db:
+            db.execute("DELETE FROM child_fts WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM documents WHERE id=?", (document_id,))
 
     def lock_document_for_deletion(self, document_id: str) -> dict[str, Any] | None:

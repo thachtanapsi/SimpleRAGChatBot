@@ -16,6 +16,8 @@ _SAFE_FIELDS = (
     "document_id",
     "chunk_ids",
     "score",
+    "fusion_score",
+    "count",
     "error",
 )
 
@@ -54,4 +56,3 @@ def configure_logging(log_dir: Path, level: str = "INFO") -> logging.Logger:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     return logger
-

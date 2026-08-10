@@ -47,7 +47,14 @@ async def test_runtime_delete_removes_vector_rows_and_upload(settings):
             {"id": "p1", "document_id": "doc1", "page": 1, "start_index": 0, "text": "parent"}
         ],
         children=[
-            {"id": "c1", "parent_id": "p1", "document_id": "doc1", "page": 1, "start_index": 0}
+            {
+                "id": "c1",
+                "parent_id": "p1",
+                "document_id": "doc1",
+                "page": 1,
+                "start_index": 0,
+                "text": "child",
+            }
         ],
         fingerprint=settings.index_fingerprint,
         collection_name=settings.collection_name,
@@ -61,6 +68,7 @@ async def test_runtime_delete_removes_vector_rows_and_upload(settings):
 
     assert runtime.index.deleted == [(["c1"], settings.collection_name)]
     assert storage.get_document("doc1") is None
+    assert storage.fts_count() == 0
     assert not path.exists()
 
 
@@ -78,4 +86,3 @@ async def test_runtime_rejects_delete_while_indexing(settings):
     with pytest.raises(DocumentBusyError):
         await runtime.delete_document("doc1")
     assert storage.get_document("doc1")["status"] == "indexing"
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 from langchain_core.documents import Document
@@ -8,7 +9,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 
 from rag_app.chat import ChatService, validate_citations
 from rag_app.errors import ServiceUnavailableError
-from rag_app.evaluation import is_abstention
+from rag_app.evaluation import is_abstention, percentile_95
 from rag_app.retrieval import ParentChildRetriever, RetrievedSource, format_context
 
 
@@ -48,18 +49,40 @@ def test_grouped_valid_citations_are_preserved():
 def test_eval_recognises_model_worded_abstention_without_citation():
     assert is_abstention("I do not have information in the provided sources.", [])
     assert not is_abstention("I do not have information, but source says X.", [{"id": "1"}])
+    assert percentile_95([1.0, 2.0, 3.0]) == 3.0
 
 
 class FakeIndex:
     def search(self, query, *, k, document_ids):
         return [
-            (Document(page_content="child A", metadata={"parent_id": "p1"}), 0.82),
-            (Document(page_content="child A2", metadata={"parent_id": "p1"}), 0.91),
-            (Document(page_content="below", metadata={"parent_id": "p2"}), 0.2),
+            (
+                Document(
+                    page_content="child A",
+                    metadata={"parent_id": "p1", "child_id": "c1"},
+                ),
+                0.82,
+            ),
+            (
+                Document(
+                    page_content="child A2",
+                    metadata={"parent_id": "p1", "child_id": "c2"},
+                ),
+                0.91,
+            ),
+            (
+                Document(
+                    page_content="below",
+                    metadata={"parent_id": "p2", "child_id": "c3"},
+                ),
+                0.2,
+            ),
         ]
 
 
 class ParentStorage:
+    def lexical_search(self, query, *, k, document_ids):
+        return []
+
     def parents_by_ids(self, ids):
         return {
             "p1": {
@@ -78,6 +101,53 @@ def test_retrieval_groups_children_and_applies_threshold(settings):
     assert len(sources) == 1
     assert sources[0].parent_id == "p1"
     assert sources[0].score == 0.91
+
+
+class HybridIndex:
+    def search(self, query, *, k, document_ids):
+        return [
+            (
+                Document(
+                    page_content="semantic",
+                    metadata={"parent_id": "p1", "child_id": "c1"},
+                ),
+                0.9,
+            ),
+            (
+                Document(
+                    page_content="exact",
+                    metadata={"parent_id": "p2", "child_id": "c2"},
+                ),
+                0.85,
+            ),
+        ]
+
+
+class HybridStorage:
+    def lexical_search(self, query, *, k, document_ids):
+        return [{"child_id": "c2", "parent_id": "p2", "document_id": "doc1"}]
+
+    def parents_by_ids(self, ids):
+        return {
+            parent_id: {
+                "id": parent_id,
+                "document_id": "doc1",
+                "filename": "paper.pdf",
+                "page": 1 if parent_id == "p1" else 2,
+                "text": f"content {parent_id}",
+            }
+            for parent_id in ids
+        }
+
+
+def test_weighted_rrf_boosts_exact_keyword_without_changing_public_score(settings):
+    hybrid_settings = replace(settings, hybrid_search=True)
+    retriever = ParentChildRetriever(
+        hybrid_settings, HybridStorage(), HybridIndex()
+    )
+    sources = retriever.retrieve("FFD-2024", ["doc1"])
+    assert [item.parent_id for item in sources] == ["p2", "p1"]
+    assert sources[0].score == 0.85
 
 
 class ChatStorage:

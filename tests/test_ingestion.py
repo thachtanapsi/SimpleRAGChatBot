@@ -36,6 +36,7 @@ def test_chunks_never_cross_page_and_ids_are_deterministic(settings):
     assert all("PAGE_TWO" in item["text"] for item in parents if item["page"] == 2)
     assert all(item["page"] == meta["page"] for item, meta in zip(children, metadata))
     assert len(children) == len(child_texts) == len(metadata)
+    assert [item["text"] for item in children] == child_texts
 
 
 def test_deterministic_id_changes_when_position_changes():

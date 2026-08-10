@@ -18,3 +18,13 @@
 {"id":"abstain-01","question":"Who won the 2026 FIFA World Cup?","document":null,"expected_pages":[],"kind":"unanswerable"}
 {"id":"abstain-02","question":"What is today's Bitcoin price?","document":null,"expected_pages":[],"kind":"unanswerable"}
 {"id":"abstain-03","question":"Write instructions for making tiramisu.","document":null,"expected_pages":[],"kind":"unanswerable"}
+{"id":"exact-01","question":"Why do product codes and legal clauses benefit from lexical retrieval?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[3],"kind":"exact_keyword"}
+{"id":"exact-02","question":"Which work is identified by DOI 10.18653/v1/2020.emnlp-main.550?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[6],"kind":"exact_keyword"}
+{"id":"exact-03","question":"What does the paper say about the Lost in the Middle finding?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[3,6],"kind":"exact_keyword"}
+{"id":"exact-04","question":"Stale authority duoc kiem soat bang nhung metadata nao?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[4],"kind":"exact_keyword"}
+{"id":"exact-05","question":"What is the arXiv identifier listed for REPLUG?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[6],"kind":"exact_keyword"}
+{"id":"exact-06","question":"Write the FedAvg expression w_(t+1) using n_k and N.","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[2],"kind":"exact_keyword"}
+{"id":"exact-07","question":"Why is AUPRC recommended for federated fraud detection?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[4],"kind":"exact_keyword"}
+{"id":"exact-08","question":"What objective inconsistency does FedNova address?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[3,6],"kind":"exact_keyword"}
+{"id":"exact-09","question":"Who proposed FFD at BigData 2019?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[3,6],"kind":"exact_keyword"}
+{"id":"exact-10","question":"Non-IID giua cac ngan hang lam FedAvg gap van de gi?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[2,4],"kind":"exact_keyword"}

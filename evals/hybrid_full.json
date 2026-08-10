@@ -1,0 +1,43 @@
+{
+  "date": "2026-08-10",
+  "model": "gemma4:e2b",
+  "embedding_model": "BAAI/bge-m3",
+  "embedding_revision": "5617a9f61b028005a4858fdac845db406aefb181",
+  "corpus": "two bundled PDF documents, fresh temporary index",
+  "cases": 30,
+  "metrics": {
+    "parent_recall_at_5": 1.0,
+    "citation_correct_page": 0.8947,
+    "abstention_accuracy": 0.6667,
+    "answers_with_citation": 1.0,
+    "irrelevant_citations": 6
+  },
+  "hybrid_comparison": {
+    "chat_mode": "hybrid",
+    "exact_keyword_cases": 10,
+    "dense_parent_recall_at_5": 1.0,
+    "hybrid_parent_recall_at_5": 1.0,
+    "dense_retrieval_p95_ms": 962.91,
+    "hybrid_retrieval_p95_ms": 784.37,
+    "latency_ratio": 0.8146,
+    "quality_gate_passed": true,
+    "latency_gate_passed": true,
+    "recommended_default": false
+  },
+  "acceptance": {
+    "parent_recall_at_5": 0.85,
+    "citation_correct_page": 0.9,
+    "abstention_accuracy": 0.9,
+    "irrelevant_citations": 0
+  },
+  "failed_case_ids": [
+    "enterprise-04",
+    "enterprise-06",
+    "fraud-06",
+    "abstain-03",
+    "exact-04",
+    "exact-07",
+    "exact-08"
+  ],
+  "notes": "Hybrid stays disabled by default. Retrieval gates passed; citation and abstention gates did not."
+}

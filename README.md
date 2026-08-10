@@ -6,10 +6,10 @@ embedding và câu trả lời không được gửi tới dịch vụ cloud.
 
 Stack mặc định:
 
-- `BAAI/bge-m3`: embedding local, chỉ đọc từ Hugging Face cache khi chạy.
+- `BAAI/bge-m3`: normalized dense embedding local, chỉ đọc từ Hugging Face cache.
 - `gemma4:e2b`: sinh câu trả lời bằng Ollama tại `127.0.0.1:11434`.
 - Chroma: vector index bền vững trên ổ đĩa.
-- SQLite: tài liệu, parent chunks, child mapping, job và lịch sử chat.
+- SQLite + FTS5/BM25: metadata, child text, lexical index, job và lịch sử chat.
 - FastAPI + HTML/CSS/JavaScript thuần; không dùng CDN hoặc Node.
 
 ## Kiến trúc
@@ -26,7 +26,8 @@ flowchart TD
         FAILED["Job failed<br/>PDF scan cần OCR"]
         PARENT["Parent chunks<br/>2.400 ký tự · overlap 200"]
         CHILD["Child chunks<br/>600 ký tự · overlap 100"]
-        EMBED["BGE-M3 local<br/>normalized embeddings"]
+        EMBED["EmbeddingService · BGE-M3<br/>batch 16 · normalized · CPU/MPS auto"]
+        LEXICAL["FTS5 index<br/>Unicode · không dấu · BM25"]
         READY["Commit job ready"]
 
         PDF --> VALIDATE
@@ -36,11 +37,13 @@ flowchart TD
         JOB --> PAGE --> TEXT
         TEXT -->|"Không"| FAILED --> SQLITE
         TEXT -->|"Có"| PARENT --> CHILD --> EMBED
+        CHILD --> LEXICAL
         EMBED -->|"Chỉ child vectors"| CHROMA[("Chroma persistent")]
         EMBED --> READY
         PARENT -.->|"Parent text + page metadata"| READY
         CHILD -.->|"Deterministic child mapping"| READY
-        READY -->|"Atomic metadata commit<br/>+ fingerprint"| SQLITE
+        LEXICAL --> READY
+        READY -->|"Atomic child + FTS commit<br/>+ fingerprint"| SQLITE
     end
 
     subgraph CHAT["2. Chat, retrieval và generation"]
@@ -48,9 +51,11 @@ flowchart TD
         HISTORY["Tối đa 6 lượt gần nhất"]
         REWRITE{"Có lịch sử?"}
         STANDALONE["Gemma viết lại thành<br/>truy vấn độc lập"]
-        SEARCH["Cosine search<br/>20 child chunks"]
-        FILTER["Chỉ document ready<br/>score ≥ 0,35"]
-        GROUP["Nhóm theo parent_id<br/>lấy score cao nhất"]
+        DENSE["Dense cosine search<br/>30 child chunks"]
+        SPARSE["FTS5/BM25 search<br/>30 child chunks"]
+        FUSION["Weighted RRF<br/>dense 0,7 · lexical 0,3 · k=60"]
+        FILTER["Dense evidence gate<br/>score ≥ 0,35"]
+        GROUP["Nhóm theo parent_id<br/>lấy fused rank tốt nhất"]
         TOP5["Chọn tối đa 5 parent"]
         EVIDENCE{"Có bằng chứng?"}
         ABSTAIN["Trả lời không tìm thấy<br/>không gọi Gemma"]
@@ -64,9 +69,13 @@ flowchart TD
 
         QUESTION --> REWRITE
         SQLITE --> HISTORY --> REWRITE
-        REWRITE -->|"Có"| STANDALONE --> SEARCH
-        REWRITE -->|"Không"| SEARCH
-        CHROMA --> SEARCH --> FILTER --> GROUP --> TOP5 --> EVIDENCE
+        REWRITE -->|"Có"| STANDALONE --> DENSE
+        REWRITE -->|"Không"| DENSE
+        STANDALONE --> SPARSE
+        REWRITE -->|"Không"| SPARSE
+        CHROMA --> DENSE --> FUSION
+        SQLITE --> SPARSE --> FUSION
+        FUSION --> FILTER --> GROUP --> TOP5 --> EVIDENCE
         EVIDENCE -->|"Không"| ABSTAIN --> SAVE
         EVIDENCE -->|"Có"| CONTEXT --> ESCAPE --> PROMPT --> GEMMA --> CHECK
         SQLITE --> CONTEXT
@@ -81,12 +90,14 @@ flowchart TD
     classDef decision fill:#fff4d6,stroke:#a16a00,color:#18221d;
     classDef model fill:#eee9fa,stroke:#6547a8,color:#18221d;
     class SQLITE,CHROMA storage;
-    class VALIDATE,TEXT,REWRITE,EVIDENCE,SAVE decision;
+    class VALIDATE,TEXT,REWRITE,EVIDENCE,SAVE,FILTER decision;
     class EMBED,STANDALONE,GEMMA model;
 ```
 
 Parent và child không bao giờ vượt ranh giới trang. ID tài liệu/chunk được tạo xác
-định từ SHA-256, số trang và vị trí chunk; retry không tạo bản trùng.
+định từ SHA-256, số trang và vị trí chunk; retry không tạo bản trùng. Lexical
+retrieval chỉ rerank parent đã vượt dense threshold, nên exact match không thể tự
+đưa một nguồn semantic yếu vào prompt.
 
 ## 1. Yêu cầu hệ thống
 
@@ -163,8 +174,9 @@ Kiểm tra sức khỏe:
 curl http://127.0.0.1:8000/api/health
 ```
 
-`status=degraded` thường có nghĩa Ollama chưa chạy hoặc thiếu `gemma4:e2b`; việc
-quản lý/index tài liệu vẫn hoạt động.
+Health response hiển thị thêm `fts`, `fts_indexed_children`, embedding device,
+dimension, revision và số input từng bị tokenizer cắt. `status=degraded` thường
+có nghĩa Ollama chưa chạy, thiếu `gemma4:e2b` hoặc một index local không sẵn sàng.
 
 ## 5. CLI
 
@@ -183,22 +195,32 @@ python chatbot.py ingest papers
 python chatbot.py ingest /duong/dan/tai_lieu.pdf
 ```
 
-Chạy bộ eval 20 câu local:
+Chạy bộ eval 30 câu local, gồm 10 câu khó về mã, số, thuật ngữ và Việt–Anh:
 
 ```bash
 python chatbot.py evaluate evals/questions.jsonl
 ```
 
-Eval báo `parent_recall_at_5`, citation đúng trang, abstention và số citation
-không liên quan. Ngưỡng nghiệm thu được ghi ngay trong kết quả JSON.
+Để nghiệm thu hybrid trước khi bật mặc định:
+
+```bash
+RAG_HYBRID_SEARCH=1 python chatbot.py evaluate evals/questions.jsonl
+```
+
+Eval báo `parent_recall_at_5`, citation đúng trang, abstention, số citation không
+liên quan và so sánh dense/hybrid trên nhóm exact-keyword. Phần
+`hybrid_comparison` ghi Recall@5, P95 latency, tỷ lệ latency và recommendation
+bật hybrid mặc định; `chat_mode` cho biết phần answer/citation đang dùng dense hay
+hybrid. Ngưỡng nghiệm thu được ghi ngay trong kết quả JSON.
 Bản baseline đã chạy trên toàn bộ hai PDF mẫu nằm tại `evals/baseline.json`;
-ground truth trang tương ứng nằm trong `evals/questions.jsonl`.
+ground truth trang tương ứng nằm trong `evals/questions.jsonl`. Kết quả benchmark
+retrieval-only giúp quyết định bật hybrid nằm tại `evals/hybrid_retrieval.json`.
 
 ## REST API
 
 | Method | Endpoint | Mục đích |
 | --- | --- | --- |
-| `GET` | `/api/health` | SQLite, Chroma, Ollama và số child đã index |
+| `GET` | `/api/health` | SQLite/FTS, Chroma, Ollama và trạng thái embedding |
 | `GET` | `/api/documents` | Danh sách tài liệu/job |
 | `POST` | `/api/documents` | Upload multipart PDF; trả `202` |
 | `GET` | `/api/documents/{id}` | Xem trạng thái một tài liệu |
@@ -249,11 +271,18 @@ dùng 6 lượt gần nhất. Chỉ một generation chạy tại một thời �
 | `RAG_DATA_DIR` | `./data` |
 | `RAG_PAPERS_DIR` | `./papers` |
 | `RAG_EMBEDDING_MODEL` | `BAAI/bge-m3` |
+| `RAG_EMBEDDING_REVISION` | revision đã resolve từ local cache; có thể pin commit |
+| `RAG_EMBED_DEVICE` | `auto` — MPS nếu khả dụng, nếu không dùng CPU |
+| `RAG_EMBED_BATCH_SIZE` | `16` |
 | `RAG_CHAT_MODEL` | `gemma4:e2b` |
 | `RAG_OLLAMA_BASE_URL` | `http://127.0.0.1:11434` |
 | `RAG_PARENT_CHUNK_SIZE` / `OVERLAP` | `2400` / `200` |
 | `RAG_CHILD_CHUNK_SIZE` / `OVERLAP` | `600` / `100` |
-| `RAG_CHILD_SEARCH_K` | `20` |
+| `RAG_DENSE_SEARCH_K` | `30`; fallback về `RAG_CHILD_SEARCH_K` cũ nếu có |
+| `RAG_LEXICAL_SEARCH_K` | `30` |
+| `RAG_RRF_K` | `60` |
+| `RAG_DENSE_WEIGHT` / `RAG_LEXICAL_WEIGHT` | `0.7` / `0.3` |
+| `RAG_HYBRID_SEARCH` | `0`; đặt `1` để bật FTS5 + weighted RRF |
 | `RAG_PARENT_SEARCH_K` | `5` |
 | `RAG_RELEVANCE_THRESHOLD` | `0.35` |
 | `RAG_MAX_UPLOAD_BYTES` | `52428800` |
@@ -261,14 +290,21 @@ dùng 6 lượt gần nhất. Chỉ một generation chạy tại một thời �
 | `RAG_ANSWER_NUM_PREDICT` | `800` |
 | `RAG_REWRITE_NUM_PREDICT` | `96` |
 
-Embedding model và thông số chunk tạo thành index fingerprint. Khi chúng thay
-đổi, tài liệu `ready` được tự động đưa về hàng đợi và reindex vào collection mới.
+Embedding model, resolved revision, dimension, backend, normalization, chunk và
+schema tạo thành index fingerprint. Khi chúng thay đổi, tài liệu `ready` được tự
+động đưa về hàng đợi và reindex vào collection mới. Sau lần nâng cấp schema FTS
+này, các tài liệu cũ sẽ tự reindex đúng một lần.
+
+Hybrid retrieval đã qua retrieval-only gate nhưng full eval gần nhất chưa đạt
+citation/abstention gate, nên mặc định an toàn vẫn là dense-only. Có thể export
+`RAG_HYBRID_SEARCH=1` để thử nghiệm; xem `evals/hybrid_retrieval.json` và
+`evals/hybrid_full.json` trước khi bật cho dữ liệu production.
 
 ## Dữ liệu và backup
 
 ```text
 data/
-├── rag.sqlite3       # metadata, job, parent chunks, hội thoại
+├── rag.sqlite3       # metadata, child text, FTS5, job, hội thoại
 ├── chroma/           # child vectors persistent
 ├── uploads/          # bản PDF do ứng dụng quản lý
 └── logs/rag.jsonl    # structured metadata log, không có nội dung riêng tư
@@ -303,9 +339,9 @@ python -m scripts.smoke
 Test hiện bao phủ:
 
 - chunk theo trang, ID xác định, SHA duplicate và validation PDF/tên file;
-- SQLite restart/job recovery/history pruning;
+- SQLite/FTS restart, tìm có dấu/không dấu, FTS injection và lifecycle delete;
 - Chroma restart không embedding lại và delete vector;
-- relevance threshold, parent grouping, query rewrite và citation formatter;
+- dense threshold, weighted RRF, parent grouping, query rewrite và citation;
 - path traversal, HTML/XML trong PDF, prompt injection và citation ID giả;
 - upload/status/delete/chat/SSE/health bằng FastAPI `TestClient`;
 - đóng stream không lưu assistant message thiếu.

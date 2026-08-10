@@ -7,11 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 
 from .chat import ChatService
 from .config import Settings
+from .embeddings import EmbeddingService
 from .errors import DocumentBusyError, DocumentNotFoundError
 from .ingestion import IngestionService, IngestionWorker
 from .logging import configure_logging
@@ -24,6 +24,7 @@ class Runtime:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings.from_env()
         self.storage: SQLiteStorage
+        self.embeddings: EmbeddingService
         self.index: ChromaIndex
         self.ingestion: IngestionService
         self.worker: IngestionWorker
@@ -31,6 +32,8 @@ class Runtime:
         self.logger: Any
         self.ollama_ready = False
         self.ollama_error: str | None = None
+        self.index_fingerprint = self.settings.index_fingerprint
+        self.collection_name = self.settings.collection_name
         self._started = False
 
     async def start(self, *, start_worker: bool = True) -> None:
@@ -45,19 +48,24 @@ class Runtime:
             self.logger.info("jobs reset", extra={"event": "jobs_reset"})
 
         # Tải BGE-M3 đúng một lần. local_files_only bảo đảm không có network fallback.
-        embeddings = await asyncio.to_thread(
-            HuggingFaceEmbeddings,
-            model_name=self.settings.embedding_model,
-            model_kwargs={"local_files_only": True},
-            encode_kwargs={"normalize_embeddings": True},
+        self.embeddings = await asyncio.to_thread(
+            EmbeddingService,
+            self.settings,
+            self.logger,
+        )
+        self.index_fingerprint = self.settings.index_fingerprint_for(
+            self.embeddings.revision
+        )
+        self.collection_name = self.settings.collection_name_for(
+            self.embeddings.revision
         )
         self.index = ChromaIndex(
-            self.settings.chroma_dir, self.settings.collection_name, embeddings
+            self.settings.chroma_dir, self.collection_name, self.embeddings
         )
 
         # Fingerprint khác dùng collection riêng. Xóa mapping/vector cũ rồi requeue.
         for document in self.storage.documents_requiring_reindex(
-            self.settings.index_fingerprint
+            self.index_fingerprint
         ):
             child_ids = self.storage.child_ids_for_document(document["id"])
             self.index.delete(child_ids, document.get("collection_name"))
@@ -92,7 +100,12 @@ class Runtime:
             rewrite_llm,
         )
         self.ingestion = IngestionService(
-            self.settings, self.storage, self.index, self.logger
+            self.settings,
+            self.storage,
+            self.index,
+            self.logger,
+            index_fingerprint=self.index_fingerprint,
+            collection_name=self.collection_name,
         )
         self.worker = IngestionWorker(self.ingestion)
         self.ingestion.seed_papers_once()
@@ -127,17 +140,36 @@ class Runtime:
 
     async def health(self) -> dict[str, Any]:
         sqlite_ok = await asyncio.to_thread(self.storage.healthcheck)
+        fts_ok = await asyncio.to_thread(self.storage.fts_healthcheck)
         chroma_ok = await asyncio.to_thread(self.index.healthcheck)
-        status = "ok" if sqlite_ok and chroma_ok and self.ollama_ready else "degraded"
+        indexed_children = await asyncio.to_thread(self.index.count)
+        fts_indexed_children = await asyncio.to_thread(self.storage.fts_count)
+        fts_index_ready = fts_ok and fts_indexed_children == indexed_children
+        status = (
+            "ok"
+            if sqlite_ok
+            and fts_index_ready
+            and chroma_ok
+            and self.ollama_ready
+            else "degraded"
+        )
         return {
             "status": status,
             "sqlite": sqlite_ok,
+            "fts": fts_ok,
+            "fts_index_ready": fts_index_ready,
             "chroma": chroma_ok,
             "ollama": self.ollama_ready,
             "ollama_error": self.ollama_error,
             "chat_model": self.settings.chat_model,
             "embedding_model": self.settings.embedding_model,
-            "indexed_children": await asyncio.to_thread(self.index.count),
+            "embedding_revision": self.embeddings.revision,
+            "embedding_device": self.embeddings.device,
+            "embedding_dimension": self.embeddings.dimension,
+            "embedding_truncated_texts": self.embeddings.truncated_texts,
+            "hybrid_search": self.settings.hybrid_search,
+            "indexed_children": indexed_children,
+            "fts_indexed_children": fts_indexed_children,
         }
 
     async def delete_document(self, document_id: str) -> None:

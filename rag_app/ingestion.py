@@ -133,6 +133,7 @@ def build_parent_child_chunks(
                         "document_id": document_id,
                         "page": page_number,
                         "start_index": child_start,
+                        "text": child_doc.page_content,
                     }
                 )
                 child_texts.append(child_doc.page_content)
@@ -156,11 +157,16 @@ class IngestionService:
         storage: SQLiteStorage,
         index: ChromaIndex,
         logger: Any,
+        *,
+        index_fingerprint: str | None = None,
+        collection_name: str | None = None,
     ):
         self.settings = settings
         self.storage = storage
         self.index = index
         self.logger = logger
+        self.index_fingerprint = index_fingerprint or settings.index_fingerprint
+        self.collection_name = collection_name or settings.collection_name
         self._upload_lock = asyncio.Lock()
         self._wake_worker: Callable[[], None] = lambda: None
 
@@ -289,8 +295,8 @@ class IngestionService:
                     page_count=len(pages),
                     parents=parents,
                     children=children,
-                    fingerprint=self.settings.index_fingerprint,
-                    collection_name=self.settings.collection_name,
+                    fingerprint=self.index_fingerprint,
+                    collection_name=self.collection_name,
                 )
             except Exception:
                 self.index.delete(child_ids)

@@ -48,22 +48,66 @@ class ParentChildRetriever:
         self.logger = logger
 
     def retrieve(self, query: str, document_ids: Sequence[str]) -> list[RetrievedSource]:
-        child_results = self.index.search(
-            query, k=self.settings.child_search_k, document_ids=document_ids
+        dense_results = self.index.search(
+            query, k=self.settings.dense_search_k, document_ids=document_ids
         )
-        parent_scores: dict[str, float] = {}
-        best_child_ids: dict[str, str] = {}
-        for child, score in child_results:
-            parent_id = str(child.metadata.get("parent_id", ""))
-            numeric_score = max(0.0, min(1.0, float(score)))
-            if parent_id and numeric_score >= self.settings.relevance_threshold:
-                if numeric_score > parent_scores.get(parent_id, 0.0):
-                    parent_scores[parent_id] = numeric_score
-                    best_child_ids[parent_id] = str(child.metadata.get("child_id", ""))
+        lexical_results = (
+            self.storage.lexical_search(
+                query, k=self.settings.lexical_search_k, document_ids=document_ids
+            )
+            if self.settings.hybrid_search
+            else []
+        )
 
-        ranked_ids = sorted(parent_scores, key=parent_scores.get, reverse=True)[
-            : self.settings.parent_search_k
-        ]
+        child_parents: dict[str, str] = {}
+        child_fusion_scores: dict[str, float] = {}
+        parent_dense_scores: dict[str, float] = {}
+
+        for rank, (child, score) in enumerate(dense_results, start=1):
+            parent_id = str(child.metadata.get("parent_id", ""))
+            if not parent_id:
+                continue
+            child_id = str(
+                child.metadata.get("child_id") or f"dense_{rank}_{parent_id}"
+            )
+            numeric_score = max(0.0, min(1.0, float(score)))
+            child_parents[child_id] = parent_id
+            child_fusion_scores[child_id] = child_fusion_scores.get(child_id, 0.0) + (
+                self.settings.dense_weight / (self.settings.rrf_k + rank)
+            )
+            parent_dense_scores[parent_id] = max(
+                numeric_score, parent_dense_scores.get(parent_id, 0.0)
+            )
+
+        for rank, child in enumerate(lexical_results, start=1):
+            child_id = str(child.get("child_id", ""))
+            parent_id = str(child.get("parent_id", ""))
+            if not child_id or not parent_id:
+                continue
+            child_parents[child_id] = parent_id
+            child_fusion_scores[child_id] = child_fusion_scores.get(child_id, 0.0) + (
+                self.settings.lexical_weight / (self.settings.rrf_k + rank)
+            )
+
+        parent_fusion_scores: dict[str, float] = {}
+        best_child_ids: dict[str, str] = {}
+        for child_id, fusion_score in child_fusion_scores.items():
+            parent_id = child_parents[child_id]
+            # Lexical retrieval chỉ rerank parent đã vượt qua dense evidence gate.
+            if parent_dense_scores.get(parent_id, 0.0) < self.settings.relevance_threshold:
+                continue
+            if fusion_score > parent_fusion_scores.get(parent_id, 0.0):
+                parent_fusion_scores[parent_id] = fusion_score
+                best_child_ids[parent_id] = child_id
+
+        ranked_ids = sorted(
+            parent_fusion_scores,
+            key=lambda parent_id: (
+                parent_fusion_scores[parent_id],
+                parent_dense_scores.get(parent_id, 0.0),
+            ),
+            reverse=True,
+        )[: self.settings.parent_search_k]
         parents = self.storage.parents_by_ids(ranked_ids)
         sources: list[RetrievedSource] = []
         for number, parent_id in enumerate(ranked_ids, start=1):
@@ -78,7 +122,8 @@ class ParentChildRetriever:
                     page=int(parent["page"]),
                     parent_id=parent_id,
                     text=parent["text"],
-                    score=parent_scores[parent_id],
+                    # API cũ tiếp tục nhận dense cosine relevance trong [0, 1].
+                    score=parent_dense_scores[parent_id],
                 )
             )
             if self.logger:
@@ -88,7 +133,8 @@ class ParentChildRetriever:
                         "event": "parent_retrieved",
                         "document_id": parent["document_id"],
                         "chunk_ids": [best_child_ids.get(parent_id, ""), parent_id],
-                        "score": round(parent_scores[parent_id], 4),
+                        "score": round(parent_dense_scores[parent_id], 4),
+                        "fusion_score": round(parent_fusion_scores[parent_id], 6),
                     },
                 )
         return sources

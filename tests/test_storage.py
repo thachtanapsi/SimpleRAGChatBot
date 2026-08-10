@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from rag_app.storage import SQLiteStorage
+from rag_app.storage import SQLiteStorage, build_fts_query
 
 
 def add_document(storage: SQLiteStorage, tmp_path: Path, doc_id="doc_hash", sha="hash"):
@@ -62,14 +62,40 @@ def test_parent_child_commit_and_delete_cascade(settings, tmp_path):
             {"id": "p1", "document_id": "doc_hash", "page": 1, "start_index": 0, "text": "parent"}
         ],
         children=[
-            {"id": "c1", "parent_id": "p1", "document_id": "doc_hash", "page": 1, "start_index": 0}
+            {
+                "id": "c1",
+                "parent_id": "p1",
+                "document_id": "doc_hash",
+                "page": 1,
+                "start_index": 0,
+                "text": "Phát hiện gian lận bằng FFD-2024",
+            }
         ],
         fingerprint=settings.index_fingerprint,
         collection_name=settings.collection_name,
     )
     assert storage.child_ids_for_document("doc_hash") == ["c1"]
-    storage.delete_document_rows("doc_hash")
-    assert storage.child_ids_for_document("doc_hash") == []
+    assert storage.fts_count() == 1
+    assert storage.lexical_search("phat hien", k=5, document_ids=["doc_hash"])[0][
+        "child_id"
+    ] == "c1"
+    assert storage.lexical_search(
+        'FFD-2024" OR *', k=5, document_ids=["doc_hash"]
+    )[0]["child_id"] == "c1"
+    assert storage.lexical_search("FFD", k=5, document_ids=["other"]) == []
+    restarted = SQLiteStorage(settings.sqlite_path)
+    restarted.initialise()
+    assert restarted.lexical_search("gian lan", k=5, document_ids=["doc_hash"])
+    restarted.delete_document_rows("doc_hash")
+    assert restarted.child_ids_for_document("doc_hash") == []
+    assert restarted.fts_count() == 0
+
+
+def test_fts_query_is_tokenised_deduplicated_and_bounded():
+    unsafe = '" OR secret* (token)'
+    query = build_fts_query(unsafe)
+    assert query == '"or" OR "secret" OR "token"'
+    assert len(build_fts_query(" ".join(f"t{i}" for i in range(40))).split(" OR ")) == 32
 
 
 def test_history_is_pruned_to_limit(settings):
