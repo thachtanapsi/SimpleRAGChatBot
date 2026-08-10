@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simple-local-rag"
+version = "1.0.0"
+description = "Local-first PDF RAG with BGE-M3, Chroma, SQLite and Gemma 4 via Ollama"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "chromadb>=1.0,<2",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "langchain-chroma>=0.2,<2",
+  "langchain-core>=1.0,<2",
+  "langchain-huggingface>=1.0,<2",
+  "langchain-ollama>=1.0,<2",
+  "langchain-text-splitters>=1.0,<2",
+  "pypdf>=6.0,<7",
+  "python-multipart>=0.0.20,<1",
+  "sentence-transformers>=5.0,<6",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+]
+
+[project.scripts]
+local-rag = "rag_app.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rag_app*"]
+
+[tool.setuptools.package-data]
+rag_app = ["static/*.html", "static/*.css", "static/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"

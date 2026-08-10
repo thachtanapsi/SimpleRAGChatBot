@@ -1,0 +1,20 @@
+{"id":"enterprise-01","question":"What is the main purpose of an enterprise RAG system?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[1,2],"kind":"answerable"}
+{"id":"enterprise-02","question":"Which components make up the basic enterprise RAG architecture?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[1,2,3,4],"kind":"answerable"}
+{"id":"enterprise-03","question":"How should retrieval quality be measured?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[1,2,3,4,5],"kind":"answerable"}
+{"id":"enterprise-04","question":"What risks are associated with hallucination?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[1,2,5],"kind":"answerable"}
+{"id":"enterprise-05","question":"Why are citations important in enterprise RAG?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[1,2,3,4,5],"kind":"answerable"}
+{"id":"enterprise-06","question":"What operational metrics should a production RAG system monitor?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[4,5],"kind":"answerable"}
+{"id":"enterprise-07","question":"When should authorization and document-status filtering happen?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[1,2,3,5],"kind":"answerable","conversation":"enterprise-security"}
+{"id":"followup-01","question":"Why should it happen at that stage?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[1,2,3,4,5],"kind":"follow_up","conversation":"enterprise-security"}
+{"id":"enterprise-08","question":"What practical deployment principles does the paper recommend?","document":"research_paper_1_enterprise_rag.pdf","expected_pages":[1,5],"kind":"answerable"}
+{"id":"fraud-01","question":"What problem does federated fraud detection solve?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[1],"kind":"answerable"}
+{"id":"fraud-02","question":"Why is federated learning useful across financial institutions?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[1,2,5],"kind":"answerable"}
+{"id":"fraud-03","question":"What privacy constraints motivate the proposed method?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[1,2,3,4,5],"kind":"answerable"}
+{"id":"fraud-04","question":"Which metrics are used to evaluate fraud detection?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[3,4],"kind":"answerable"}
+{"id":"fraud-05","question":"What are the limitations of the federated approach?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[1,2,3,4,5],"kind":"answerable"}
+{"id":"fraud-06","question":"How does Federated Averaging combine client updates?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[2],"kind":"answerable"}
+{"id":"fraud-07","question":"What is secure aggregation in this system?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[1,2,3,4,5],"kind":"answerable","conversation":"fraud-privacy"}
+{"id":"followup-02","question":"How does that improve privacy?","document":"research_paper_2_federated_fraud_detection.pdf","expected_pages":[1,2,3,4,5],"kind":"follow_up","conversation":"fraud-privacy"}
+{"id":"abstain-01","question":"Who won the 2026 FIFA World Cup?","document":null,"expected_pages":[],"kind":"unanswerable"}
+{"id":"abstain-02","question":"What is today's Bitcoin price?","document":null,"expected_pages":[],"kind":"unanswerable"}
+{"id":"abstain-03","question":"Write instructions for making tiramisu.","document":null,"expected_pages":[],"kind":"unanswerable"}

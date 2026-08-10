@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Simple Local RAG</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="layout">
+      <aside class="documents-panel">
+        <div class="brand">
+          <span class="local-dot" aria-hidden="true"></span>
+          <div>
+            <h1>Simple Local RAG</h1>
+            <p>BGE-M3 · Gemma 4 · Local</p>
+          </div>
+        </div>
+
+        <form id="upload-form" class="upload-card">
+          <label for="pdf-file">Thêm tài liệu PDF</label>
+          <input id="pdf-file" name="file" type="file" accept="application/pdf,.pdf" required>
+          <button type="submit">Upload và index</button>
+          <small>Tối đa 50 MB, 300 trang, PDF phải có text.</small>
+        </form>
+        <div id="upload-status" class="status" role="status"></div>
+
+        <div class="section-heading">
+          <h2>Tài liệu</h2>
+          <button id="refresh-documents" class="icon-button" type="button" aria-label="Tải lại">↻</button>
+        </div>
+        <div id="documents" class="documents" aria-live="polite"></div>
+      </aside>
+
+      <section class="chat-panel">
+        <header class="chat-header">
+          <div>
+            <h2>Hỏi đáp tài liệu</h2>
+            <p id="health">Đang kiểm tra dịch vụ…</p>
+          </div>
+          <button id="new-chat" class="secondary" type="button">Hội thoại mới</button>
+        </header>
+
+        <div id="messages" class="messages" aria-live="polite">
+          <div class="welcome">
+            <h3>PDF của bạn không rời khỏi máy</h3>
+            <p>Chọn tài liệu ở bên trái hoặc để mặc định tìm trên tất cả tài liệu đã sẵn sàng.</p>
+          </div>
+        </div>
+
+        <form id="chat-form" class="composer">
+          <label class="sr-only" for="question">Câu hỏi</label>
+          <textarea id="question" maxlength="4000" rows="2" placeholder="Hỏi điều gì đó từ tài liệu…" required></textarea>
+          <button id="send" type="submit">Gửi</button>
+        </form>
+      </section>
+    </main>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
+

@@ -1,1 +1,23 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Dữ liệu local: PDF upload, SQLite, Chroma và log.
+data/
+
+# Model/cache có thể rất lớn và không thuộc source code.
+.cache/
+models/
+
+# Secret và cấu hình riêng từng máy.
 .env
+.env.*
+!.env.example
+
+.DS_Store

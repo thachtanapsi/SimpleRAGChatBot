@@ -1,0 +1,22 @@
+{
+  "date": "2026-08-10",
+  "model": "gemma4:e2b",
+  "embedding_model": "BAAI/bge-m3",
+  "index_fingerprint": "4cc4a7ab07cf972a6cdd4d1f0ba7ffb4807626106d922cb3d9073e8cd7eb7d40",
+  "corpus": "all ready sample documents",
+  "cases": 20,
+  "metrics": {
+    "parent_recall_at_5": 1.0,
+    "citation_correct_page": 1.0,
+    "abstention_accuracy": 1.0,
+    "answers_with_citation": 1.0,
+    "irrelevant_citations": 0
+  },
+  "acceptance": {
+    "parent_recall_at_5": 0.85,
+    "citation_correct_page": 0.9,
+    "abstention_accuracy": 0.9,
+    "irrelevant_citations": 0
+  },
+  "notes": "Ground-truth pages were human-reviewed against every cited claim after the baseline run and are now frozen in questions.jsonl."
+}
