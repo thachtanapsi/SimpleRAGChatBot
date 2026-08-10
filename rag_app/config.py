@@ -46,6 +46,8 @@ class Settings:
     parent_chunk_overlap: int = 200
     child_chunk_size: int = 600
     child_chunk_overlap: int = 100
+    cross_page_enabled: bool = True
+    cross_page_context_chars: int = 1200
     # child_search_k được giữ làm alias tương thích với cấu hình cũ.
     child_search_k: int = 30
     dense_search_k: int = 30
@@ -96,6 +98,10 @@ class Settings:
             parent_chunk_overlap=_env_int("RAG_PARENT_CHUNK_OVERLAP", 200),
             child_chunk_size=_env_int("RAG_CHILD_CHUNK_SIZE", 600),
             child_chunk_overlap=_env_int("RAG_CHILD_CHUNK_OVERLAP", 100),
+            cross_page_enabled=_env_bool("RAG_CROSS_PAGE_ENABLED", True),
+            cross_page_context_chars=_env_int(
+                "RAG_CROSS_PAGE_CONTEXT_CHARS", 1200
+            ),
             child_search_k=legacy_child_k,
             dense_search_k=_env_int("RAG_DENSE_SEARCH_K", legacy_child_k),
             lexical_search_k=_env_int("RAG_LEXICAL_SEARCH_K", 30),
@@ -152,8 +158,11 @@ class Settings:
             "parent_chunk_overlap": self.parent_chunk_overlap,
             "child_chunk_size": self.child_chunk_size,
             "child_chunk_overlap": self.child_chunk_overlap,
+            "cross_page_enabled": self.cross_page_enabled,
+            "cross_page_context_chars": self.cross_page_context_chars,
+            "bridge_child_strategy": "boundary_plus_parent_windows_v1",
             "normalise_embeddings": True,
-            "schema": 2,
+            "schema": 4,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
@@ -182,6 +191,8 @@ class Settings:
             raise ValueError("RAG_EMBED_DEVICE chỉ hỗ trợ auto, cpu hoặc mps")
         if self.embedding_dimension <= 0 or self.embedding_batch_size <= 0:
             raise ValueError("Cấu hình embedding phải lớn hơn 0")
+        if self.cross_page_context_chars <= 0:
+            raise ValueError("RAG_CROSS_PAGE_CONTEXT_CHARS phải lớn hơn 0")
         if self.dense_weight <= 0 or self.lexical_weight < 0:
             raise ValueError("Dense weight phải dương và lexical weight không được âm")
         if min(

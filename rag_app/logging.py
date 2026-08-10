@@ -18,6 +18,7 @@ _SAFE_FIELDS = (
     "score",
     "fusion_score",
     "count",
+    "cross_page_bridges",
     "error",
 )
 

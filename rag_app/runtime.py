@@ -36,14 +36,21 @@ class Runtime:
         self.collection_name = self.settings.collection_name
         self._started = False
 
-    async def start(self, *, start_worker: bool = True) -> None:
+    async def start(
+        self,
+        *,
+        start_worker: bool = True,
+        reset_interrupted_jobs: bool = True,
+    ) -> None:
         if self._started:
             return
         self.settings.ensure_directories()
         self.logger = configure_logging(self.settings.logs_dir, self.settings.log_level)
         self.storage = SQLiteStorage(self.settings.sqlite_path)
         self.storage.initialise()
-        reset_count = self.storage.reset_interrupted_jobs()
+        reset_count = (
+            self.storage.reset_interrupted_jobs() if reset_interrupted_jobs else 0
+        )
         if reset_count:
             self.logger.info("jobs reset", extra={"event": "jobs_reset"})
 
@@ -171,6 +178,50 @@ class Runtime:
             "indexed_children": indexed_children,
             "fts_indexed_children": fts_indexed_children,
         }
+
+    async def force_reindex(self) -> dict[str, list[str]]:
+        """Xóa index dẫn xuất và đưa mọi PDF hợp lệ về hàng đợi.
+
+        Caller phải khởi tạo runtime với ``start_worker=False`` để worker không
+        claim một document trong lúc danh sách đang được chuẩn bị.
+        """
+
+        documents = self.storage.list_documents()
+        indexing = [item["id"] for item in documents if item["status"] == "indexing"]
+        if indexing:
+            raise DocumentBusyError("Không thể reindex khi tài liệu đang indexing")
+
+        scheduled: list[str] = []
+        skipped: list[str] = []
+        for document in documents:
+            document_id = str(document["id"])
+            stored_path = Path(document["stored_path"])
+            if document.get("error") == "deleting" or not stored_path.is_file():
+                skipped.append(document_id)
+                continue
+
+            child_ids = self.storage.child_ids_for_document(document_id)
+            await asyncio.to_thread(
+                self.index.delete,
+                child_ids,
+                document.get("collection_name"),
+            )
+            self.storage.requeue_document(document_id)
+            scheduled.append(document_id)
+            self.logger.info(
+                "document reindex queued",
+                extra={
+                    "event": "document_reindex_queued",
+                    "document_id": document_id,
+                    "chunk_ids": child_ids[:20],
+                },
+            )
+
+        self.logger.info(
+            "force reindex queued",
+            extra={"event": "force_reindex_queued", "count": len(scheduled)},
+        )
+        return {"scheduled": scheduled, "skipped": skipped}
 
     async def delete_document(self, document_id: str) -> None:
         document = self.storage.lock_document_for_deletion(document_id)

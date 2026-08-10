@@ -6,13 +6,14 @@ from pathlib import Path
 
 import pytest
 from fastapi import UploadFile
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
 from starlette.datastructures import Headers
 
 from rag_app.errors import ValidationError
 from rag_app.ingestion import (
     IngestionService,
     build_parent_child_chunks,
+    detect_cross_page_boundaries,
     deterministic_id,
     inspect_pdf,
     safe_pdf_name,
@@ -20,7 +21,7 @@ from rag_app.ingestion import (
 from rag_app.storage import SQLiteStorage
 
 
-def test_chunks_never_cross_page_and_ids_are_deterministic(settings):
+def test_page_chunks_never_cross_page_and_ids_are_deterministic(settings):
     pages = ["PAGE_ONE " * 40, "PAGE_TWO " * 40]
     first = build_parent_child_chunks(
         file_hash="abc", filename="paper.pdf", pages=pages, settings=settings
@@ -32,11 +33,147 @@ def test_chunks_never_cross_page_and_ids_are_deterministic(settings):
 
     assert [item["id"] for item in parents] == [item["id"] for item in second[0]]
     assert [item["id"] for item in children] == [item["id"] for item in second[1]]
+    assert all(item["kind"] == "page" for item in parents)
+    assert all(item["page_end"] == item["page"] for item in parents)
     assert all("PAGE_ONE" in item["text"] for item in parents if item["page"] == 1)
     assert all("PAGE_TWO" in item["text"] for item in parents if item["page"] == 2)
     assert all(item["page"] == meta["page"] for item, meta in zip(children, metadata))
     assert len(children) == len(child_texts) == len(metadata)
     assert [item["text"] for item in children] == child_texts
+
+
+def test_detects_table_and_prose_continuations_without_false_heading_match():
+    pages = [
+        "REPORT\n1\nThe identifier is contin-",
+        "REPORT\n2\nued on this page.\nLayer Example metrics Primary question\nGrounding Claims Evidence?",
+        "REPORT\n3\nLayer Example metrics Primary question\nAnswer quality Accuracy Does it work?",
+        "REPORT\n4\n6. Independent section\nThis page starts a new topic.",
+    ]
+    layouts = [
+        pages[0],
+        "REPORT\n2\nLayer   Example metrics   Primary question\nGrounding   Claims   Evidence?",
+        "REPORT\n3\nLayer   Example metrics   Primary question\nAnswer quality   Accuracy   Does it work?",
+        pages[3],
+    ]
+
+    boundaries = detect_cross_page_boundaries(pages, layouts)
+
+    assert [(item.page, item.page_end, item.boundary_type) for item in boundaries] == [
+        (1, 2, "prose"),
+        (2, 3, "table"),
+    ]
+
+
+def test_bridge_chunks_are_bounded_deterministic_and_keep_page_range(settings):
+    configured = replace(
+        settings,
+        parent_chunk_size=120,
+        parent_chunk_overlap=10,
+        child_chunk_size=60,
+        child_chunk_overlap=5,
+        cross_page_context_chars=60,
+    )
+    pages = ["DOCUMENT\n1\nEvidence before boundary without punctuation", "DOCUMENT\n2\ncontinues after boundary with detail."]
+    first = build_parent_child_chunks(
+        file_hash="bridge-hash",
+        filename="paper.pdf",
+        pages=pages,
+        settings=configured,
+    )
+    second = build_parent_child_chunks(
+        file_hash="bridge-hash",
+        filename="paper.pdf",
+        pages=pages,
+        settings=configured,
+    )
+    bridge_parents = [item for item in first[0] if item["kind"] == "bridge"]
+    bridge_children = [item for item in first[1] if item["kind"] == "bridge"]
+
+    assert len(bridge_parents) == 1
+    assert len(bridge_children) >= 2
+    assert len(bridge_parents[0]["text"]) <= configured.parent_chunk_size
+    assert all(
+        len(item["text"]) <= configured.child_chunk_size
+        for item in bridge_children
+    )
+    assert bridge_parents[0]["page"] == 1
+    assert bridge_parents[0]["page_end"] == 2
+    assert [item["id"] for item in bridge_children] == [
+        item["id"] for item in second[1] if item["kind"] == "bridge"
+    ]
+    bridge_metadata = [item for item in first[3] if item["kind"] == "bridge"]
+    assert {item["bridge_variant"] for item in bridge_metadata} == {
+        "boundary",
+        "context",
+    }
+    assert all(item["page_end"] == 2 for item in bridge_metadata)
+
+
+def test_enterprise_pdf_cross_page_regression(settings):
+    pdf = Path(__file__).parents[1] / "papers" / "research_paper_1_enterprise_rag.pdf"
+    reader = PdfReader(pdf)
+    pages = [(page.extract_text() or "").strip() for page in reader.pages]
+    layouts = [
+        (page.extract_text(extraction_mode="layout") or "").strip()
+        for page in reader.pages
+    ]
+    boundaries = detect_cross_page_boundaries(pages, layouts)
+    assert [(item.page, item.page_end, item.boundary_type) for item in boundaries] == [
+        (1, 2, "prose"),
+        (3, 4, "table"),
+        (4, 5, "prose"),
+    ]
+
+    production_chunks = replace(
+        settings,
+        parent_chunk_size=2400,
+        parent_chunk_overlap=200,
+        child_chunk_size=600,
+        child_chunk_overlap=100,
+        cross_page_context_chars=1200,
+    )
+    parents, children, _, _ = build_parent_child_chunks(
+        file_hash="enterprise",
+        filename=pdf.name,
+        pages=pages,
+        layout_pages=layouts,
+        settings=production_chunks,
+    )
+    table_parent = next(
+        item
+        for item in parents
+        if item["kind"] == "bridge" and item["page"] == 3
+    )
+    table_child = next(
+        item
+        for item in children
+        if item["kind"] == "bridge" and item["page"] == 3
+    )
+    assert table_parent["text"].casefold().count(
+        "layer example metrics primary question"
+    ) == 1
+    assert "Answer quality" in table_child["text"]
+    assert "Safety & governance" in table_child["text"]
+    assert all(
+        label in table_parent["text"]
+        for label in (
+            "Retrieval",
+            "Context quality",
+            "Grounding",
+            "Answer quality",
+            "Operations",
+            "Safety & governance",
+        )
+    )
+    table_children = [
+        item
+        for item in children
+        if item["kind"] == "bridge" and item["page"] == 3
+    ]
+    assert any(
+        "single aggregate score" in item["text"].casefold()
+        for item in table_children
+    )
 
 
 def test_deterministic_id_changes_when_position_changes():

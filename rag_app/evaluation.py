@@ -38,6 +38,15 @@ def percentile_95(values: list[float]) -> float:
     return round(ordered[index], 2)
 
 
+def page_range_matches(
+    page: int, page_end: int | None, expected_pages: set[int]
+) -> bool:
+    """Một citation khoảng trang đúng khi chứa ít nhất một trang kỳ vọng."""
+
+    end = page if page_end is None else page_end
+    return not expected_pages or any(page <= expected <= end for expected in expected_pages)
+
+
 async def evaluate_file(path: Path) -> int:
     cases = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if len(cases) < 20:
@@ -99,9 +108,10 @@ async def evaluate_file(path: Path) -> int:
                 for label, sources in retrieval_outputs.items():
                     if any(
                         source.filename == expected_document
-                        and (
-                            not expected_pages_for_probe
-                            or source.page in expected_pages_for_probe
+                        and page_range_matches(
+                            source.page,
+                            source.page_end,
+                            expected_pages_for_probe,
                         )
                         for source in sources
                     ):
@@ -132,7 +142,9 @@ async def evaluate_file(path: Path) -> int:
             totals["answerable"] += 1
             retrieval_hit = any(
                 item["filename"] == expected_document
-                and (not expected_pages or item["page"] in expected_pages)
+                and page_range_matches(
+                    int(item["page"]), item.get("page_end"), expected_pages
+                )
                 for item in retrieved
             )
             if retrieval_hit:
@@ -143,13 +155,19 @@ async def evaluate_file(path: Path) -> int:
             for item in cited:
                 totals["cited_sources"] += 1
                 if item["filename"] == expected_document and (
-                    not expected_pages or item["page"] in expected_pages
+                    page_range_matches(
+                        int(item["page"]), item.get("page_end"), expected_pages
+                    )
                 ):
                     totals["correct_citations"] += 1
                 else:
                     totals["irrelevant_citations"] += 1
                     invalid_citations.append(
-                        {"filename": item["filename"], "page": item["page"]}
+                        {
+                            "filename": item["filename"],
+                            "page": item["page"],
+                            "page_end": item.get("page_end", item["page"]),
+                        }
                     )
             if not retrieval_hit or invalid_citations:
                 diagnostics.append(

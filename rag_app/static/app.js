@@ -110,7 +110,9 @@ function renderCitations(container, citations) {
   for (const source of citations.filter((item) => item.cited)) {
     const chip = document.createElement("span");
     chip.className = "citation";
-    chip.textContent = `[${source.id}] ${source.filename} · trang ${source.page}`;
+    const pageEnd = source.page_end || source.page;
+    const pageLabel = pageEnd === source.page ? `${source.page}` : `${source.page}–${pageEnd}`;
+    chip.textContent = `[${source.id}] ${source.filename} · trang ${pageLabel}`;
     chip.title = source.snippet;
     container.append(chip);
   }
@@ -227,4 +229,3 @@ async function initialise() {
 }
 
 initialise();
-

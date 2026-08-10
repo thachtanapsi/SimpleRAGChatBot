@@ -32,3 +32,18 @@ def test_hybrid_boolean_and_resolved_revision_affect_configuration(tmp_path, mon
     assert settings.index_fingerprint_for("commit-a") != settings.index_fingerprint_for(
         "commit-b"
     )
+
+
+def test_cross_page_configuration_and_fingerprint(tmp_path, monkeypatch):
+    default = Settings.from_env(tmp_path)
+    assert default.cross_page_enabled is True
+    assert default.cross_page_context_chars == 1200
+
+    monkeypatch.setenv("RAG_CROSS_PAGE_ENABLED", "0")
+    monkeypatch.setenv("RAG_CROSS_PAGE_CONTEXT_CHARS", "900")
+    changed = Settings.from_env(tmp_path)
+    assert changed.cross_page_enabled is False
+    assert changed.cross_page_context_chars == 900
+    assert changed.index_fingerprint_for("commit") != default.index_fingerprint_for(
+        "commit"
+    )

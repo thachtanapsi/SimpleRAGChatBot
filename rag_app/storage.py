@@ -93,6 +93,8 @@ class SQLiteStorage:
                     id TEXT PRIMARY KEY,
                     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
                     page INTEGER NOT NULL,
+                    page_end INTEGER NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('page', 'bridge')),
                     start_index INTEGER NOT NULL,
                     text TEXT NOT NULL
                 );
@@ -105,6 +107,8 @@ class SQLiteStorage:
                     parent_id TEXT NOT NULL REFERENCES parents(id) ON DELETE CASCADE,
                     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
                     page INTEGER NOT NULL,
+                    page_end INTEGER NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('page', 'bridge')),
                     start_index INTEGER NOT NULL,
                     text TEXT NOT NULL DEFAULT ''
                 );
@@ -137,11 +141,29 @@ class SQLiteStorage:
                 );
                 """
             )
+            parent_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(parents)")
+            }
+            if "page_end" not in parent_columns:
+                db.execute("ALTER TABLE parents ADD COLUMN page_end INTEGER")
+            if "kind" not in parent_columns:
+                db.execute(
+                    "ALTER TABLE parents ADD COLUMN kind TEXT NOT NULL DEFAULT 'page'"
+                )
+            db.execute("UPDATE parents SET page_end=page WHERE page_end IS NULL")
+
             child_columns = {
                 row["name"] for row in db.execute("PRAGMA table_info(children)")
             }
             if "text" not in child_columns:
                 db.execute("ALTER TABLE children ADD COLUMN text TEXT NOT NULL DEFAULT ''")
+            if "page_end" not in child_columns:
+                db.execute("ALTER TABLE children ADD COLUMN page_end INTEGER")
+            if "kind" not in child_columns:
+                db.execute(
+                    "ALTER TABLE children ADD COLUMN kind TEXT NOT NULL DEFAULT 'page'"
+                )
+            db.execute("UPDATE children SET page_end=page WHERE page_end IS NULL")
             try:
                 db.execute(
                     """
@@ -157,7 +179,7 @@ class SQLiteStorage:
             except sqlite3.OperationalError as exc:
                 raise RuntimeError("SQLite hiện tại không hỗ trợ FTS5") from exc
             db.execute(
-                "INSERT INTO app_meta(key, value) VALUES ('schema_version', '2') "
+                "INSERT INTO app_meta(key, value) VALUES ('schema_version', '3') "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
 
@@ -276,27 +298,43 @@ class SQLiteStorage:
         fingerprint: str,
         collection_name: str,
     ) -> None:
+        normalised_parents = [
+            {
+                **parent,
+                "page_end": parent.get("page_end", parent["page"]),
+                "kind": parent.get("kind", "page"),
+            }
+            for parent in parents
+        ]
+        normalised_children = [
+            {
+                **child,
+                "page_end": child.get("page_end", child["page"]),
+                "kind": child.get("kind", "page"),
+            }
+            for child in children
+        ]
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM child_fts WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM children WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM parents WHERE document_id=?", (document_id,))
             db.executemany(
-                "INSERT INTO parents(id, document_id, page, start_index, text) "
-                "VALUES (:id, :document_id, :page, :start_index, :text)",
-                parents,
+                "INSERT INTO parents(id, document_id, page, page_end, kind, start_index, text) "
+                "VALUES (:id, :document_id, :page, :page_end, :kind, :start_index, :text)",
+                normalised_parents,
             )
             db.executemany(
-                "INSERT INTO children(id, parent_id, document_id, page, start_index, text) "
-                "VALUES (:id, :parent_id, :document_id, :page, :start_index, :text)",
-                children,
+                "INSERT INTO children(id, parent_id, document_id, page, page_end, kind, start_index, text) "
+                "VALUES (:id, :parent_id, :document_id, :page, :page_end, :kind, :start_index, :text)",
+                normalised_children,
             )
             db.executemany(
                 "INSERT INTO child_fts(child_id, parent_id, document_id, text) "
                 "VALUES (:id, :parent_id, :document_id, :fts_text)",
                 [
                     {**child, "fts_text": normalise_fts_text(str(child["text"]))}
-                    for child in children
+                    for child in normalised_children
                 ],
             )
             changed = db.execute(

@@ -19,6 +19,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("chat", help="Chat tương tác trong terminal")
     ingest = commands.add_parser("ingest", help="Import một PDF hoặc thư mục PDF")
     ingest.add_argument("path", nargs="?", default="papers")
+    commands.add_parser(
+        "reindex", help="Ép tạo lại index cho toàn bộ PDF đang được quản lý"
+    )
     evaluate = commands.add_parser("evaluate", help="Chạy bộ eval local JSONL")
     evaluate.add_argument("path", nargs="?", default="evals/questions.jsonl")
     serve = commands.add_parser("serve", help="Chạy web/API trên localhost")
@@ -78,6 +81,37 @@ async def ingest_command(path: Path) -> int:
         await runtime.stop()
 
 
+async def reindex_command() -> int:
+    runtime = Runtime()
+    # Không reset job ``indexing``: nếu server khác đang xử lý, force_reindex
+    # phải nhìn thấy trạng thái đó và từ chối thay vì coi là job bị gián đoạn.
+    await runtime.start(start_worker=False, reset_interrupted_jobs=False)
+    try:
+        result = await runtime.force_reindex()
+        scheduled = set(result["scheduled"])
+        skipped = result["skipped"]
+        if scheduled:
+            runtime.worker.start()
+            await wait_for_jobs(runtime)
+
+        documents = {
+            item["id"]: item for item in runtime.storage.list_documents()
+        }
+        failed = [
+            document_id
+            for document_id in scheduled
+            if documents.get(document_id, {}).get("status") != "ready"
+        ]
+        succeeded = len(scheduled) - len(failed)
+        print(
+            f"Đã reindex {succeeded}/{len(scheduled)} tài liệu; "
+            f"failed={len(failed)}; skipped={len(skipped)}."
+        )
+        return 1 if failed or skipped else 0
+    finally:
+        await runtime.stop()
+
+
 async def chat_command() -> int:
     runtime = Runtime()
     await runtime.start()
@@ -104,7 +138,15 @@ async def chat_command() -> int:
             print(f"\nGemma: {response['answer']}")
             for citation in response["citations"]:
                 if citation["cited"]:
-                    print(f"  [{citation['id']}] {citation['filename']} — trang {citation['page']}")
+                    page_end = citation.get("page_end", citation["page"])
+                    page_label = (
+                        str(citation["page"])
+                        if page_end == citation["page"]
+                        else f"{citation['page']}–{page_end}"
+                    )
+                    print(
+                        f"  [{citation['id']}] {citation['filename']} — trang {page_label}"
+                    )
         return 0
     finally:
         await runtime.stop()
@@ -120,6 +162,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if command == "ingest":
         return asyncio.run(ingest_command(Path(args.path)))
+    if command == "reindex":
+        return asyncio.run(reindex_command())
     if command == "evaluate":
         from .evaluation import evaluate_file
 

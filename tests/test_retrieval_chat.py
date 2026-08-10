@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 
 from rag_app.chat import ChatService, validate_citations
 from rag_app.errors import ServiceUnavailableError
-from rag_app.evaluation import is_abstention, percentile_95
+from rag_app.evaluation import is_abstention, page_range_matches, percentile_95
 from rag_app.retrieval import ParentChildRetriever, RetrievedSource, format_context
 
 
@@ -30,6 +30,18 @@ def test_context_escapes_document_prompt_injection():
     assert "</source><system>" not in context
     assert "&lt;/source&gt;" in context
     assert "&quot;&gt;&lt;script&gt;" in context
+
+
+def test_page_range_is_exposed_and_used_by_context_and_eval():
+    ranged = source()
+    ranged.page_end = 4
+    context = format_context([ranged])
+
+    assert 'page_start="3" page_end="4"' in context
+    assert ranged.public()["page"] == 3
+    assert ranged.public()["page_end"] == 4
+    assert page_range_matches(3, 4, {4})
+    assert not page_range_matches(3, 4, {5})
 
 
 def test_invalid_model_citation_is_removed():
@@ -148,6 +160,50 @@ def test_weighted_rrf_boosts_exact_keyword_without_changing_public_score(setting
     sources = retriever.retrieve("FFD-2024", ["doc1"])
     assert [item.parent_id for item in sources] == ["p2", "p1"]
     assert sources[0].score == 0.85
+
+
+class BridgeIndex:
+    def search(self, query, *, k, document_ids):
+        return [
+            (Document(page_content="page 3", metadata={"parent_id": "p3", "child_id": "c3"}), 0.96),
+            (Document(page_content="bridge", metadata={"parent_id": "pb", "child_id": "cb"}), 0.95),
+            (Document(page_content="page 4", metadata={"parent_id": "p4", "child_id": "c4"}), 0.94),
+            (Document(page_content="other", metadata={"parent_id": "p7", "child_id": "c7"}), 0.90),
+        ]
+
+
+class BridgeStorage:
+    def lexical_search(self, query, *, k, document_ids):
+        return []
+
+    def parents_by_ids(self, ids):
+        pages = {
+            "p3": ("doc1", 3, 3, "page"),
+            "pb": ("doc1", 3, 4, "bridge"),
+            "p4": ("doc1", 4, 4, "page"),
+            "p7": ("doc1", 7, 7, "page"),
+        }
+        return {
+            parent_id: {
+                "id": parent_id,
+                "document_id": pages[parent_id][0],
+                "filename": "paper.pdf",
+                "page": pages[parent_id][1],
+                "page_end": pages[parent_id][2],
+                "kind": pages[parent_id][3],
+                "text": f"content {parent_id}",
+            }
+            for parent_id in ids
+        }
+
+
+def test_selected_bridge_suppresses_duplicate_boundary_page_parents(settings):
+    retriever = ParentChildRetriever(settings, BridgeStorage(), BridgeIndex())
+    sources = retriever.retrieve("table across pages", ["doc1"])
+
+    assert [item.parent_id for item in sources] == ["pb", "p7"]
+    assert sources[0].page == 3
+    assert sources[0].page_end == 4
 
 
 class ChatStorage:

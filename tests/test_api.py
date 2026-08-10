@@ -41,13 +41,25 @@ class FakeIngestion:
 
 
 class FakeChat:
+    citation = {
+        "id": "1",
+        "filename": "paper.pdf",
+        "page": 3,
+        "page_end": 4,
+        "cited": True,
+    }
+
     async def answer(self, question, session_id, document_ids):
-        return {"session_id": session_id or "new-session", "answer": "answer [1]", "citations": []}
+        return {
+            "session_id": session_id or "new-session",
+            "answer": "answer [1]",
+            "citations": [self.citation],
+        }
 
     async def stream(self, question, session_id, document_ids):
         yield {"event": "meta", "data": {"session_id": session_id or "new-session"}}
         yield {"event": "token", "data": {"text": "answer"}}
-        yield {"event": "sources", "data": {"citations": []}}
+        yield {"event": "sources", "data": {"citations": [self.citation]}}
         yield {"event": "done", "data": {"answer": "answer"}}
 
 
@@ -84,11 +96,13 @@ def test_api_upload_status_delete_chat_sse_and_health(settings):
 
         answer = client.post("/api/chat", json={"question": "Question"})
         assert answer.json()["session_id"] == "new-session"
+        assert answer.json()["citations"][0]["page_end"] == 4
 
         stream = client.post("/api/chat/stream", json={"question": "Question"})
         assert "event: meta" in stream.text
         assert "event: token" in stream.text
         assert "event: sources" in stream.text
+        assert '"page_end":4' in stream.text
         assert "event: done" in stream.text
 
         assert client.get("/api/sessions/session/messages").status_code == 200
@@ -104,3 +118,5 @@ def test_static_ui_has_no_cdn(settings):
         assert page.status_code == 200
         assert "cdn" not in page.text.lower()
         assert "/static/app.js" in page.text
+        script = client.get("/static/app.js")
+        assert "source.page_end" in script.text

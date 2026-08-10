@@ -21,11 +21,13 @@ flowchart TD
         VALIDATE{"PDF hợp lệ?"}
         REJECT["Từ chối upload<br/>400 / 409"]
         JOB["SQLite job<br/>pending → indexing"]
-        PAGE["pypdf đọc từng trang<br/>giữ filename, document_id, page"]
+        PAGE["pypdf đọc text + layout từng trang<br/>giữ filename, document_id, page"]
         TEXT{"Tổng text ≥ 100 ký tự?"}
         FAILED["Job failed<br/>PDF scan cần OCR"]
-        PARENT["Parent chunks<br/>2.400 ký tự · overlap 200"]
+        BOUNDARY{"Có nội dung tiếp nối<br/>qua trang?"}
+        PARENT["Page parent chunks<br/>2.400 ký tự · overlap 200"]
         CHILD["Child chunks<br/>600 ký tự · overlap 100"]
+        BRIDGE["Bridge parent + child windows<br/>hai trang liền kề"]
         EMBED["EmbeddingService · BGE-M3<br/>batch 16 · normalized · CPU/MPS auto"]
         LEXICAL["FTS5 index<br/>Unicode · không dấu · BM25"]
         READY["Commit job ready"]
@@ -36,11 +38,14 @@ flowchart TD
         JOB -->|"Lưu trạng thái"| SQLITE[("SQLite")]
         JOB --> PAGE --> TEXT
         TEXT -->|"Không"| FAILED --> SQLITE
-        TEXT -->|"Có"| PARENT --> CHILD --> EMBED
+        TEXT -->|"Có"| BOUNDARY --> PARENT --> CHILD --> EMBED
+        BOUNDARY -->|"Bảng lặp header / câu dang dở"| BRIDGE --> EMBED
         CHILD --> LEXICAL
+        BRIDGE --> LEXICAL
         EMBED -->|"Chỉ child vectors"| CHROMA[("Chroma persistent")]
         EMBED --> READY
         PARENT -.->|"Parent text + page metadata"| READY
+        BRIDGE -.->|"page_start + page_end"| READY
         CHILD -.->|"Deterministic child mapping"| READY
         LEXICAL --> READY
         READY -->|"Atomic child + FTS commit<br/>+ fingerprint"| SQLITE
@@ -94,10 +99,15 @@ flowchart TD
     class EMBED,STANDALONE,GEMMA model;
 ```
 
-Parent và child không bao giờ vượt ranh giới trang. ID tài liệu/chunk được tạo xác
-định từ SHA-256, số trang và vị trí chunk; retry không tạo bản trùng. Lexical
-retrieval chỉ rerank parent đã vượt dense threshold, nên exact match không thể tự
-đưa một nguồn semantic yếu vào prompt.
+Page parent/child thông thường không vượt ranh giới trang. Khi phát hiện câu đang
+dang dở hoặc header bảng lặp ở trang kế tiếp, ingestion bổ sung một bridge parent
+tối đa 2.400 ký tự, một boundary child nhìn thấy cả hai phía và các context child
+phủ toàn parent; mỗi child tối đa 600 ký tự. Nhờ đó truy vấn khớp phần dẫn ở trang
+trước vẫn nạp được toàn bộ phần tiếp nối ở trang sau. Nguồn bridge được citation
+theo khoảng như `trang 3–4`; chunk một trang vẫn giữ API `page` cũ. ID tài
+liệu/chunk được tạo xác định từ SHA-256, số trang và vị trí chunk; retry không tạo
+bản trùng. Lexical retrieval chỉ rerank parent đã vượt dense threshold, nên exact
+match không thể tự đưa một nguồn semantic yếu vào prompt.
 
 ## 1. Yêu cầu hệ thống
 
@@ -195,6 +205,23 @@ python chatbot.py ingest papers
 python chatbot.py ingest /duong/dan/tai_lieu.pdf
 ```
 
+Ép tạo lại parent/child, Chroma và FTS cho toàn bộ PDF đã upload, kể cả khi
+fingerprint không đổi. Hãy dừng Web/CLI đang chạy trước khi gọi lệnh này:
+
+```bash
+python chatbot.py reindex
+```
+
+Lệnh giữ nguyên PDF và hội thoại trong SQLite, chỉ xóa dữ liệu index dẫn xuất rồi
+đưa tài liệu về `pending → indexing → ready`. Kết quả thành công có dạng:
+
+```text
+Đã reindex 3/3 tài liệu; failed=0; skipped=0.
+```
+
+`failed` là PDF được chạy lại nhưng indexing thất bại; `skipped` là tài liệu đang
+ở trạng thái xóa hoặc không còn file gốc trong `data/uploads/`.
+
 Chạy bộ eval 30 câu local, gồm 10 câu khó về mã, số, thuật ngữ và Việt–Anh:
 
 ```bash
@@ -260,6 +287,9 @@ dùng 6 lượt gần nhất. Chỉ một generation chạy tại một thời �
 16 GB. Nếu client ngắt SSE trước khi sinh xong, assistant message dở dang không
 được lưu.
 
+Mỗi citation luôn có `page` (trang bắt đầu, tương thích client cũ) và `page_end`.
+Với nguồn một trang hai giá trị bằng nhau; với bridge UI hiển thị khoảng trang.
+
 ## Cấu hình `RAG_*`
 
 Ứng dụng chỉ đọc biến môi trường; nó không tự tải `.env` và không đọc
@@ -278,6 +308,8 @@ dùng 6 lượt gần nhất. Chỉ một generation chạy tại một thời �
 | `RAG_OLLAMA_BASE_URL` | `http://127.0.0.1:11434` |
 | `RAG_PARENT_CHUNK_SIZE` / `OVERLAP` | `2400` / `200` |
 | `RAG_CHILD_CHUNK_SIZE` / `OVERLAP` | `600` / `100` |
+| `RAG_CROSS_PAGE_ENABLED` | `1`; phát hiện và index bridge qua trang |
+| `RAG_CROSS_PAGE_CONTEXT_CHARS` | `1200` ký tự tối đa cho mỗi phía bridge parent |
 | `RAG_DENSE_SEARCH_K` | `30`; fallback về `RAG_CHILD_SEARCH_K` cũ nếu có |
 | `RAG_LEXICAL_SEARCH_K` | `30` |
 | `RAG_RRF_K` | `60` |
@@ -290,10 +322,10 @@ dùng 6 lượt gần nhất. Chỉ một generation chạy tại một thời �
 | `RAG_ANSWER_NUM_PREDICT` | `800` |
 | `RAG_REWRITE_NUM_PREDICT` | `96` |
 
-Embedding model, resolved revision, dimension, backend, normalization, chunk và
-schema tạo thành index fingerprint. Khi chúng thay đổi, tài liệu `ready` được tự
-động đưa về hàng đợi và reindex vào collection mới. Sau lần nâng cấp schema FTS
-này, các tài liệu cũ sẽ tự reindex đúng một lần.
+Embedding model, resolved revision, dimension, backend, normalization, chunk,
+cấu hình cross-page và schema tạo thành index fingerprint. Khi chúng thay đổi,
+tài liệu `ready` được tự động đưa về hàng đợi và reindex vào collection mới. Sau
+lần nâng cấp schema cross-page này, các tài liệu cũ sẽ tự reindex đúng một lần.
 
 Hybrid retrieval đã qua retrieval-only gate nhưng full eval gần nhất chưa đạt
 citation/abstention gate, nên mặc định an toàn vẫn là dense-only. Có thể export
@@ -338,10 +370,10 @@ python -m scripts.smoke
 
 Test hiện bao phủ:
 
-- chunk theo trang, ID xác định, SHA duplicate và validation PDF/tên file;
+- chunk theo trang, bridge bảng/đoạn văn, ID xác định, SHA duplicate và validation PDF/tên file;
 - SQLite/FTS restart, tìm có dấu/không dấu, FTS injection và lifecycle delete;
 - Chroma restart không embedding lại và delete vector;
-- dense threshold, weighted RRF, parent grouping, query rewrite và citation;
+- dense threshold, weighted RRF, parent grouping, bridge dedupe, query rewrite và citation khoảng trang;
 - path traversal, HTML/XML trong PDF, prompt injection và citation ID giả;
 - upload/status/delete/chat/SSE/health bằng FastAPI `TestClient`;
 - đóng stream không lưu assistant message thiếu.

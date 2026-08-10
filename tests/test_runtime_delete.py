@@ -86,3 +86,71 @@ async def test_runtime_rejects_delete_while_indexing(settings):
     with pytest.raises(DocumentBusyError):
         await runtime.delete_document("doc1")
     assert storage.get_document("doc1")["status"] == "indexing"
+
+
+@pytest.mark.asyncio
+async def test_force_reindex_deletes_derived_index_and_requeues_document(settings):
+    storage = SQLiteStorage(settings.sqlite_path)
+    storage.initialise()
+    path = create_document(storage, settings, "doc1", "hash1")
+    storage.claim_next_pending()
+    storage.finish_indexing(
+        document_id="doc1",
+        page_count=1,
+        parents=[
+            {
+                "id": "p1",
+                "document_id": "doc1",
+                "page": 1,
+                "page_end": 1,
+                "kind": "page",
+                "start_index": 0,
+                "text": "parent",
+            }
+        ],
+        children=[
+            {
+                "id": "c1",
+                "parent_id": "p1",
+                "document_id": "doc1",
+                "page": 1,
+                "page_end": 1,
+                "kind": "page",
+                "start_index": 0,
+                "text": "child",
+            }
+        ],
+        fingerprint=settings.index_fingerprint,
+        collection_name=settings.collection_name,
+    )
+    runtime = Runtime(settings)
+    runtime.storage = storage
+    runtime.index = FakeIndex()
+    runtime.logger = FakeLogger()
+
+    result = await runtime.force_reindex()
+
+    assert result == {"scheduled": ["doc1"], "skipped": []}
+    assert runtime.index.deleted == [(["c1"], settings.collection_name)]
+    assert storage.get_document("doc1")["status"] == "pending"
+    assert storage.child_ids_for_document("doc1") == []
+    assert storage.fts_count() == 0
+    assert path.is_file()
+
+
+@pytest.mark.asyncio
+async def test_force_reindex_rejects_active_indexing_job(settings):
+    storage = SQLiteStorage(settings.sqlite_path)
+    storage.initialise()
+    create_document(storage, settings, "doc1", "hash1")
+    storage.claim_next_pending()
+    runtime = Runtime(settings)
+    runtime.storage = storage
+    runtime.index = FakeIndex()
+    runtime.logger = FakeLogger()
+
+    with pytest.raises(DocumentBusyError, match="reindex"):
+        await runtime.force_reindex()
+
+    assert runtime.index.deleted == []
+    assert storage.get_document("doc1")["status"] == "indexing"

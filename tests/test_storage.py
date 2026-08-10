@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,49 @@ def test_duplicate_hash_and_restart_persist(settings, tmp_path):
     restarted = SQLiteStorage(settings.sqlite_path)
     restarted.initialise()
     assert restarted.get_document("doc_hash")["filename"] == "paper.pdf"
+
+
+def test_schema_v2_parent_child_rows_migrate_to_page_ranges(settings):
+    settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(settings.sqlite_path) as db:
+        db.executescript(
+            """
+            CREATE TABLE parents (
+                id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                page INTEGER NOT NULL,
+                start_index INTEGER NOT NULL,
+                text TEXT NOT NULL
+            );
+            CREATE TABLE children (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                page INTEGER NOT NULL,
+                start_index INTEGER NOT NULL,
+                text TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO parents VALUES ('p1', 'doc1', 3, 0, 'parent');
+            INSERT INTO children VALUES ('c1', 'p1', 'doc1', 3, 0, 'child');
+            """
+        )
+
+    storage = SQLiteStorage(settings.sqlite_path)
+    storage.initialise()
+
+    with sqlite3.connect(settings.sqlite_path) as db:
+        parent = db.execute(
+            "SELECT page, page_end, kind FROM parents WHERE id='p1'"
+        ).fetchone()
+        child = db.execute(
+            "SELECT page, page_end, kind FROM children WHERE id='c1'"
+        ).fetchone()
+        version = db.execute(
+            "SELECT value FROM app_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+    assert parent == (3, 3, "page")
+    assert child == (3, 3, "page")
+    assert version == "3"
 
 
 def test_interrupted_job_returns_to_pending(settings, tmp_path):
@@ -75,6 +119,9 @@ def test_parent_child_commit_and_delete_cascade(settings, tmp_path):
         collection_name=settings.collection_name,
     )
     assert storage.child_ids_for_document("doc_hash") == ["c1"]
+    parent = storage.parents_by_ids(["p1"])["p1"]
+    assert parent["page_end"] == 1
+    assert parent["kind"] == "page"
     assert storage.fts_count() == 1
     assert storage.lexical_search("phat hien", k=5, document_ids=["doc_hash"])[0][
         "child_id"

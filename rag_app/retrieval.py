@@ -20,6 +20,12 @@ class RetrievedSource:
     parent_id: str
     text: str
     score: float
+    page_end: int | None = None
+    kind: str = "page"
+
+    @property
+    def resolved_page_end(self) -> int:
+        return self.page if self.page_end is None else self.page_end
 
     def public(self, cited: bool = False) -> dict[str, Any]:
         return {
@@ -27,6 +33,7 @@ class RetrievedSource:
             "document_id": self.document_id,
             "filename": self.filename,
             "page": self.page,
+            "page_end": self.resolved_page_end,
             "parent_id": self.parent_id,
             "snippet": self.text[:500],
             "score": round(self.score, 4),
@@ -100,15 +107,50 @@ class ParentChildRetriever:
                 parent_fusion_scores[parent_id] = fusion_score
                 best_child_ids[parent_id] = child_id
 
-        ranked_ids = sorted(
+        all_ranked_ids = sorted(
             parent_fusion_scores,
             key=lambda parent_id: (
                 parent_fusion_scores[parent_id],
                 parent_dense_scores.get(parent_id, 0.0),
             ),
             reverse=True,
-        )[: self.settings.parent_search_k]
-        parents = self.storage.parents_by_ids(ranked_ids)
+        )
+        parents = self.storage.parents_by_ids(all_ranked_ids)
+
+        # Bridge thay thế các parent một trang nằm đúng hai trang biên để prompt
+        # không nhận cùng một bằng chứng hai lần. Tiếp tục quét để luôn đủ top-k.
+        selected: list[dict[str, Any]] = []
+        for parent_id in all_ranked_ids:
+            parent = parents.get(parent_id)
+            if not parent:
+                continue
+            page = int(parent["page"])
+            page_end = int(parent.get("page_end") or page)
+            kind = str(parent.get("kind") or "page")
+            if kind == "page" and any(
+                item["document_id"] == parent["document_id"]
+                and str(item.get("kind") or "page") == "bridge"
+                and int(item["page"]) <= page <= int(item.get("page_end") or item["page"])
+                for item in selected
+            ):
+                continue
+            if kind == "bridge":
+                selected = [
+                    item
+                    for item in selected
+                    if not (
+                        item["document_id"] == parent["document_id"]
+                        and str(item.get("kind") or "page") == "page"
+                        and page
+                        <= int(item["page"])
+                        <= page_end
+                    )
+                ]
+            selected.append(parent)
+            if len(selected) >= self.settings.parent_search_k:
+                break
+
+        ranked_ids = [str(parent["id"]) for parent in selected]
         sources: list[RetrievedSource] = []
         for number, parent_id in enumerate(ranked_ids, start=1):
             parent = parents.get(parent_id)
@@ -120,10 +162,12 @@ class ParentChildRetriever:
                     document_id=parent["document_id"],
                     filename=parent["filename"],
                     page=int(parent["page"]),
+                    page_end=int(parent.get("page_end") or parent["page"]),
                     parent_id=parent_id,
                     text=parent["text"],
                     # API cũ tiếp tục nhận dense cosine relevance trong [0, 1].
                     score=parent_dense_scores[parent_id],
+                    kind=str(parent.get("kind") or "page"),
                 )
             )
             if self.logger:
@@ -147,7 +191,8 @@ def format_context(sources: Sequence[RetrievedSource]) -> str:
     for source in sources:
         blocks.append(
             f'<source id="[{escape(source.id)}]" '
-            f'filename="{escape(source.filename, quote=True)}" page="{source.page}">\n'
+            f'filename="{escape(source.filename, quote=True)}" '
+            f'page_start="{source.page}" page_end="{source.resolved_page_end}">\n'
             f"{escape(source.text)}\n"
             "</source>"
         )
