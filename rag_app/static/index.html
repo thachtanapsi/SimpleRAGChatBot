@@ -29,7 +29,87 @@
           <h2>Tài liệu</h2>
           <button id="refresh-documents" class="icon-button" type="button" aria-label="Tải lại">↻</button>
         </div>
+        <form id="document-filters" class="document-filters">
+          <label for="source-type">Nguồn</label>
+          <select id="source-type">
+            <option value="trading_digest">Research</option>
+            <option value="pdf">PDF</option>
+            <option value="">Tất cả</option>
+          </select>
+          <label for="content-kind-filter">Mức phân tích</label>
+          <select id="content-kind-filter">
+            <option value="">Daily digest và Full Analysis</option>
+            <option value="daily_digest_v1">Daily digest</option>
+            <option value="full_report_v1">Full Analysis</option>
+          </select>
+          <label for="ticker-filter">Mã</label>
+          <input id="ticker-filter" maxlength="20" placeholder="HPG">
+          <div class="date-filters">
+            <label>Từ <input id="date-from" type="date"></label>
+            <label>Đến <input id="date-to" type="date"></label>
+          </div>
+          <label for="section-filter">Mục digest</label>
+          <select id="section-filter">
+            <option value="">Tất cả mục</option>
+            <option value="summary">Tổng quan</option>
+            <option value="market">Thị trường</option>
+            <option value="fundamentals">Cơ bản</option>
+            <option value="news_events">Tin tức &amp; sự kiện</option>
+            <option value="sentiment">Tâm lý</option>
+            <option value="macro">Vĩ mô</option>
+            <option value="catalysts">Yếu tố hỗ trợ</option>
+            <option value="risks_unknowns">Rủi ro</option>
+            <option value="next_session_watch">Theo dõi phiên tới</option>
+            <option value="analyst.market">Full · Phân tích thị trường</option>
+            <option value="analyst.sentiment">Full · Phân tích tâm lý</option>
+            <option value="analyst.news">Full · Phân tích tin tức</option>
+            <option value="analyst.fundamentals">Full · Phân tích cơ bản</option>
+            <option value="research.bull">Full · Luận điểm tích cực</option>
+            <option value="research.bear">Full · Luận điểm thận trọng</option>
+            <option value="research.manager">Full · Kết luận nghiên cứu</option>
+            <option value="trading.plan">Full · Kế hoạch giao dịch</option>
+            <option value="risk.aggressive">Full · Rủi ro tích cực</option>
+            <option value="risk.conservative">Full · Rủi ro thận trọng</option>
+            <option value="risk.neutral">Full · Rủi ro trung lập</option>
+            <option value="portfolio.decision">Full · Quyết định danh mục</option>
+          </select>
+          <label for="report-stage-filter">Stage Full Analysis</label>
+          <select id="report-stage-filter">
+            <option value="">Tất cả stage</option>
+            <option value="digest">Daily digest</option>
+            <option value="market">Market</option>
+            <option value="sentiment">Sentiment</option>
+            <option value="news">News</option>
+            <option value="fundamentals">Fundamentals</option>
+            <option value="research">Research</option>
+            <option value="trader">Trader</option>
+            <option value="risk">Risk / Portfolio</option>
+          </select>
+          <label for="research-mode-filter">Chế độ phân tích</label>
+          <select id="research-mode-filter">
+            <option value="">Tất cả chế độ</option>
+            <option value="eod">Cuối ngày</option>
+            <option value="live">Chạy trực tiếp</option>
+            <option value="historical">Dựng lại lịch sử</option>
+            <option value="legacy_unknown">Dữ liệu cũ chưa gắn nhãn</option>
+          </select>
+          <label for="data-provenance-filter">Nguồn thời điểm dữ liệu</label>
+          <select id="data-provenance-filter">
+            <option value="">Tất cả nguồn thời điểm</option>
+            <option value="eod_cutoff">Cutoff cuối ngày</option>
+            <option value="request_cutoff">Cutoff khi yêu cầu</option>
+            <option value="historical_replay">Dựng lại lịch sử</option>
+            <option value="legacy_unknown">Dữ liệu cũ chưa gắn nhãn</option>
+          </select>
+          <button type="submit" class="secondary">Áp dụng bộ lọc</button>
+          <small id="active-batch">Đang tìm batch mới nhất…</small>
+        </form>
         <div id="documents" class="documents" aria-live="polite"></div>
+        <div class="document-pagination">
+          <button id="previous-documents" type="button" class="secondary">‹</button>
+          <span id="document-page">Trang 1</span>
+          <button id="next-documents" type="button" class="secondary">›</button>
+        </div>
       </aside>
 
       <section class="chat-panel">
@@ -44,7 +124,7 @@
         <div id="messages" class="messages" aria-live="polite">
           <div class="welcome">
             <h3>PDF của bạn không rời khỏi máy</h3>
-            <p>Chọn tài liệu ở bên trái hoặc để mặc định tìm trên tất cả tài liệu đã sẵn sàng.</p>
+            <p>Dùng bộ lọc ở bên trái để tìm trên daily digest, Full Analysis mới nhất hoặc chọn một số PDF.</p>
           </div>
         </div>
 
@@ -55,7 +135,7 @@
         </form>
       </section>
     </main>
+    <script src="/static/markdown.js" defer></script>
     <script src="/static/app.js" defer></script>
   </body>
 </html>
-

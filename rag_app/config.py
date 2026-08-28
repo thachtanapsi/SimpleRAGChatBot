@@ -37,7 +37,7 @@ class Settings:
     embedding_model: str = "BAAI/bge-m3"
     embedding_revision: str | None = None
     embedding_device: str = "auto"
-    embedding_batch_size: int = 16
+    embedding_batch_size: int = 32
     embedding_dimension: int = 1024
     embedding_backend: str = "sentence-transformers"
     chat_model: str = "gemma4:e2b"
@@ -64,9 +64,12 @@ class Settings:
     max_question_chars: int = 4000
     history_turns: int = 6
     max_session_messages: int = 100
-    answer_num_predict: int = 800
+    answer_num_predict: int = 2048
     rewrite_num_predict: int = 96
     log_level: str = "INFO"
+    rag_service_api_key: str | None = None
+    digest_max_batch_size: int = 50
+    digest_writer_claim_size: int = 25
 
     @classmethod
     def from_env(cls, base_dir: Path | None = None) -> "Settings":
@@ -89,7 +92,7 @@ class Settings:
             embedding_model=os.environ.get("RAG_EMBEDDING_MODEL", "BAAI/bge-m3"),
             embedding_revision=embedding_revision,
             embedding_device=os.environ.get("RAG_EMBED_DEVICE", "auto").lower(),
-            embedding_batch_size=_env_int("RAG_EMBED_BATCH_SIZE", 16),
+            embedding_batch_size=_env_int("RAG_EMBED_BATCH_SIZE", 32),
             chat_model=os.environ.get("RAG_CHAT_MODEL", "gemma4:e2b"),
             ollama_base_url=os.environ.get(
                 "RAG_OLLAMA_BASE_URL", "http://127.0.0.1:11434"
@@ -117,9 +120,12 @@ class Settings:
             max_question_chars=_env_int("RAG_MAX_QUESTION_CHARS", 4000),
             history_turns=_env_int("RAG_HISTORY_TURNS", 6),
             max_session_messages=_env_int("RAG_MAX_SESSION_MESSAGES", 100),
-            answer_num_predict=_env_int("RAG_ANSWER_NUM_PREDICT", 800),
+            answer_num_predict=_env_int("RAG_ANSWER_NUM_PREDICT", 2048),
             rewrite_num_predict=_env_int("RAG_REWRITE_NUM_PREDICT", 96),
             log_level=os.environ.get("RAG_LOG_LEVEL", "INFO").upper(),
+            rag_service_api_key=os.environ.get("RAG_SERVICE_API_KEY") or None,
+            digest_max_batch_size=_env_int("RAG_DIGEST_MAX_BATCH_SIZE", 50),
+            digest_writer_claim_size=_env_int("RAG_DIGEST_WRITER_CLAIM_SIZE", 25),
         )
         settings.validate()
         return settings
@@ -162,7 +168,8 @@ class Settings:
             "cross_page_context_chars": self.cross_page_context_chars,
             "bridge_child_strategy": "boundary_plus_parent_windows_v1",
             "normalise_embeddings": True,
-            "schema": 4,
+            "schema": 6,
+            "digest_sections": "independent_provenance_v2",
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
@@ -204,5 +211,7 @@ class Settings:
             self.max_pdf_pages,
             self.answer_num_predict,
             self.rewrite_num_predict,
+            self.digest_max_batch_size,
+            self.digest_writer_claim_size,
         ) <= 0:
             raise ValueError("Các giới hạn cấu hình phải lớn hơn 0")

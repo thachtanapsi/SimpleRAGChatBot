@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import shutil
 import sys
 from pathlib import Path
 
 from .config import Settings
+from .full_reports import canonicalise_full_report
 from .ingestion import inspect_pdf, safe_pdf_name, sha256_file
 from .runtime import Runtime
+from .storage import SQLiteStorage
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,8 +28,20 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate = commands.add_parser("evaluate", help="Chạy bộ eval local JSONL")
     evaluate.add_argument("path", nargs="?", default="evals/questions.jsonl")
     serve = commands.add_parser("serve", help="Chạy web/API trên localhost")
-    serve.add_argument("--host", default="127.0.0.1", choices=["127.0.0.1", "localhost"])
+    serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        choices=["127.0.0.1", "localhost", "0.0.0.0"],
+        help="Mặc định chỉ loopback; 0.0.0.0 chỉ dành cho mạng container tin cậy",
+    )
     serve.add_argument("--port", default=8000, type=int)
+    backfill = commands.add_parser(
+        "backfill-full-reports",
+        help="Dựng canonical Full Analysis payload từ SQLite hiện hữu",
+    )
+    mode = backfill.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -152,6 +167,71 @@ async def chat_command() -> int:
         await runtime.stop()
 
 
+def backfill_full_reports_command(*, apply: bool) -> int:
+    """Backfill without constructing embeddings, Chroma, Ollama or an LLM."""
+
+    settings = Settings.from_env()
+    storage = SQLiteStorage(settings.sqlite_path)
+    storage.initialise()
+    counts = {
+        "scanned": 0,
+        "stored": 0,
+        "partial": 0,
+        "requeued": 0,
+        "failed": 0,
+    }
+    for candidate in storage.full_report_backfill_candidates():
+        counts["scanned"] += 1
+        try:
+            report = canonicalise_full_report(
+                storage.reconstruct_full_report_wire(str(candidate["id"]))
+            )
+            if report.decision_status == "partial":
+                counts["partial"] += 1
+            needs_store = (
+                candidate.get("canonical_sha256") != report.canonical_sha256
+                or candidate.get("decision_sha256") != report.decision_sha256
+                or candidate.get("stored_canonical_json") != report.canonical_json
+                or candidate.get("stored_decision_json") != report.decision_json
+                or candidate.get("stored_decision_status")
+                != report.decision_status
+                or candidate.get("projection_version")
+                != report.projection_version
+            )
+            needs_reindex = (
+                candidate.get("decision_sha256") != report.decision_sha256
+                or candidate.get("projection_version")
+                != report.projection_version
+                or candidate.get("decision_index_version")
+                != report.projection_version
+            )
+            if not needs_store and not needs_reindex:
+                continue
+            if candidate["status"] == "indexing":
+                raise RuntimeError("Full Analysis đang indexing")
+            if apply:
+                storage.store_full_report_payload(str(candidate["id"]), report)
+                counts["stored"] += 1
+                if needs_reindex and candidate["status"] in {"ready", "failed"}:
+                    storage.requeue_document(str(candidate["id"]))
+                    counts["requeued"] += 1
+            else:
+                counts["stored"] += 1
+                if needs_reindex and candidate["status"] in {"ready", "failed"}:
+                    counts["requeued"] += 1
+        except Exception:
+            counts["failed"] += 1
+    print(
+        json.dumps(
+            {"mode": "apply" if apply else "dry-run", **counts},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 1 if counts["failed"] else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     command = args.command or "chat"
@@ -168,6 +248,8 @@ def main(argv: list[str] | None = None) -> int:
         from .evaluation import evaluate_file
 
         return asyncio.run(evaluate_file(Path(args.path)))
+    if command == "backfill-full-reports":
+        return backfill_full_reports_command(apply=bool(args.apply))
     return asyncio.run(chat_command())
 
 

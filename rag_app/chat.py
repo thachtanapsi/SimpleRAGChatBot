@@ -11,13 +11,14 @@ from typing import Any, AsyncIterator, Sequence
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from .config import Settings
-from .errors import ServiceUnavailableError, ValidationError
+from .errors import GenerationTruncatedError, ServiceUnavailableError, ValidationError
 from .retrieval import ParentChildRetriever, RetrievedSource, format_context
 from .storage import SQLiteStorage
 
 
 CITATION_RE = re.compile(r"\[((?:\d+\s*,\s*)*\d+)\]")
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+TRUNCATED_DONE_REASONS = frozenset({"length", "max_length", "max_tokens"})
 
 REWRITE_SYSTEM_PROMPT = """Rewrite the latest user question as one standalone search query.
 Use the conversation only to resolve references such as pronouns or follow-up phrases.
@@ -47,6 +48,27 @@ def message_text(message: Any) -> str:
                 parts.append(item["text"])
         return "".join(parts)
     return str(content)
+
+
+def generation_was_truncated(message: Any, token_limit: int) -> bool:
+    """Detect an Ollama response that stopped at the configured output limit."""
+
+    metadata = getattr(message, "response_metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+
+    done_reason = metadata.get("done_reason") or metadata.get("finish_reason")
+    if done_reason:
+        return str(done_reason).strip().lower() in TRUNCATED_DONE_REASONS
+
+    eval_count = metadata.get("eval_count")
+    if isinstance(eval_count, bool) or eval_count is None:
+        return False
+    try:
+        generated_tokens = int(eval_count)
+    except (TypeError, ValueError):
+        return False
+    return token_limit > 0 and generated_tokens >= token_limit
 
 
 def validate_citations(answer: str, sources: Sequence[RetrievedSource]) -> tuple[str, set[str]]:
@@ -97,7 +119,8 @@ class ChatService:
         question: str,
         session_id: str | None,
         document_ids: Sequence[str] | None,
-    ) -> tuple[str, str, list[str]]:
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[str, str, list[str], dict[str, Any] | None]:
         question = question.strip()
         if not question:
             raise ValidationError("Câu hỏi không được để trống")
@@ -109,11 +132,22 @@ class ChatService:
         if not SESSION_ID_RE.fullmatch(selected_session):
             raise ValidationError("session_id không hợp lệ")
         requested = list(dict.fromkeys(document_ids)) if document_ids is not None else None
-        ready = self.storage.ready_document_ids(requested)
-        if requested is not None and set(ready) != set(requested):
-            raise ValidationError("document_ids chứa tài liệu không tồn tại hoặc chưa ready")
+        if requested is not None:
+            requested_ready = self.storage.ready_document_ids(requested)
+            if set(requested_ready) != set(requested):
+                raise ValidationError("document_ids chứa tài liệu không tồn tại hoặc chưa ready")
+        normalised_filters = dict(filters) if filters else None
+        if normalised_filters and normalised_filters.get("tickers"):
+            normalised_filters["tickers"] = [
+                str(ticker).upper() for ticker in normalised_filters["tickers"]
+            ]
+        ready = (
+            self.storage.ready_document_ids(requested, normalised_filters)
+            if normalised_filters
+            else self.storage.ready_document_ids(requested)
+        )
         self.storage.ensure_session(selected_session)
-        return question, selected_session, ready
+        return question, selected_session, ready, normalised_filters
 
     async def _rewrite_query(
         self, question: str, history: Sequence[dict[str, Any]]
@@ -146,9 +180,10 @@ class ChatService:
         question: str,
         session_id: str | None,
         document_ids: Sequence[str] | None,
+        filters: dict[str, Any] | None = None,
     ) -> tuple[str, str, list[RetrievedSource]]:
-        question, selected_session, ready_ids = self._validate_request(
-            question, session_id, document_ids
+        question, selected_session, ready_ids, selected_filters = self._validate_request(
+            question, session_id, document_ids, filters
         )
         if not ready_ids:
             return question, selected_session, []
@@ -156,7 +191,16 @@ class ChatService:
             selected_session, self.settings.history_turns * 2
         )
         query = await self._rewrite_query(question, history)
-        sources = await asyncio.to_thread(self.retriever.retrieve, query, ready_ids)
+        if selected_filters or document_ids is None:
+            sources = await asyncio.to_thread(
+                self.retriever.retrieve,
+                query,
+                ready_ids,
+                filters=selected_filters,
+                restrict_document_ids=document_ids is not None,
+            )
+        else:
+            sources = await asyncio.to_thread(self.retriever.retrieve, query, ready_ids)
         return question, selected_session, sources
 
     def _answer_messages(
@@ -181,9 +225,10 @@ class ChatService:
         question: str,
         session_id: str | None = None,
         document_ids: Sequence[str] | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         question, selected_session, sources = await self._prepare(
-            question, session_id, document_ids
+            question, session_id, document_ids, filters
         )
         if not sources:
             answer = abstention_for(question)
@@ -197,11 +242,13 @@ class ChatService:
         try:
             async with self.generation_lock:
                 result = await self.llm.ainvoke(self._answer_messages(question, sources))
-            answer, cited = validate_citations(message_text(result), sources)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             raise ServiceUnavailableError("Ollama không thể sinh câu trả lời") from exc
+        if generation_was_truncated(result, self.settings.answer_num_predict):
+            raise GenerationTruncatedError(self.settings.answer_num_predict)
+        answer, cited = validate_citations(message_text(result), sources)
         self.storage.add_exchange(
             selected_session, question, answer, self.settings.max_session_messages
         )
@@ -216,9 +263,10 @@ class ChatService:
         question: str,
         session_id: str | None = None,
         document_ids: Sequence[str] | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         question, selected_session, sources = await self._prepare(
-            question, session_id, document_ids
+            question, session_id, document_ids, filters
         )
         yield {"event": "meta", "data": {"session_id": selected_session}}
         if not sources:
@@ -235,9 +283,13 @@ class ChatService:
             return
 
         raw_parts: list[str] = []
+        truncated = False
         try:
             async with self.generation_lock:
                 async for chunk in self.llm.astream(self._answer_messages(question, sources)):
+                    truncated = truncated or generation_was_truncated(
+                        chunk, self.settings.answer_num_predict
+                    )
                     text = message_text(chunk)
                     if text:
                         raw_parts.append(text)
@@ -247,6 +299,9 @@ class ChatService:
             raise
         except Exception as exc:
             raise ServiceUnavailableError("Ollama không thể stream câu trả lời") from exc
+
+        if truncated:
+            raise GenerationTruncatedError(self.settings.answer_num_predict)
 
         answer, cited = validate_citations("".join(raw_parts), sources)
         # Client đã nhận token thô; event done mang bản đã loại citation giả để UI chuẩn hóa.

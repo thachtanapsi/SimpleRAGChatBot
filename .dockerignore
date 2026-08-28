@@ -1,0 +1,5 @@
+**
+!pyproject.toml
+!README.md
+!rag_app/
+!rag_app/**

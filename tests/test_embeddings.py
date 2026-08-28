@@ -55,7 +55,7 @@ def test_embedding_service_batches_normalises_and_detects_truncation(settings):
     assert len(vectors) == 2
     assert len(vectors[0]) == 1024
     assert math.isclose(math.sqrt(sum(value * value for value in vectors[0])), 1.0)
-    assert service.model.encode_kwargs["batch_size"] == 16
+    assert service.model.encode_kwargs["batch_size"] == 32
     assert service.model.encode_kwargs["normalize_embeddings"] is True
     assert service.truncated_texts == 1
     assert service.revision == "resolved-commit"

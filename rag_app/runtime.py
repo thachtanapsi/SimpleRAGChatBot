@@ -12,7 +12,7 @@ from langchain_ollama import ChatOllama
 from .chat import ChatService
 from .config import Settings
 from .embeddings import EmbeddingService
-from .errors import DocumentBusyError, DocumentNotFoundError
+from .errors import ConflictError, DocumentBusyError, DocumentNotFoundError
 from .ingestion import IngestionService, IngestionWorker
 from .logging import configure_logging
 from .retrieval import ParentChildRetriever
@@ -74,13 +74,12 @@ class Runtime:
         for document in self.storage.documents_requiring_reindex(
             self.index_fingerprint
         ):
-            child_ids = self.storage.child_ids_for_document(document["id"])
-            self.index.delete(child_ids, document.get("collection_name"))
             self.storage.requeue_document(document["id"])
 
         answer_llm = ChatOllama(
             model=self.settings.chat_model,
             base_url=self.settings.ollama_base_url,
+            reasoning=False,
             temperature=0.2,
             top_p=0.9,
             top_k=40,
@@ -90,6 +89,7 @@ class Runtime:
         rewrite_llm = ChatOllama(
             model=self.settings.chat_model,
             base_url=self.settings.ollama_base_url,
+            reasoning=False,
             temperature=0,
             num_ctx=4096,
             num_predict=self.settings.rewrite_num_predict,
@@ -113,6 +113,11 @@ class Runtime:
             self.logger,
             index_fingerprint=self.index_fingerprint,
             collection_name=self.collection_name,
+        )
+        # Resume a batch provenance upgrade that committed to SQLite before a
+        # prior process could update the derived Chroma metadata.
+        await asyncio.to_thread(
+            self.ingestion.reconcile_vector_metadata_updates
         )
         self.worker = IngestionWorker(self.ingestion)
         self.ingestion.seed_papers_once()
@@ -151,13 +156,21 @@ class Runtime:
         chroma_ok = await asyncio.to_thread(self.index.healthcheck)
         indexed_children = await asyncio.to_thread(self.index.count)
         fts_indexed_children = await asyncio.to_thread(self.storage.fts_count)
+        full_report_payloads = await asyncio.to_thread(
+            self.storage.full_report_payload_health
+        )
         fts_index_ready = fts_ok and fts_indexed_children == indexed_children
+        full_report_payloads_ready = (
+            full_report_payloads["missing_ready_payloads"] == 0
+            and full_report_payloads["pending_ready_decision_indexes"] == 0
+        )
         status = (
             "ok"
             if sqlite_ok
             and fts_index_ready
             and chroma_ok
             and self.ollama_ready
+            and full_report_payloads_ready
             else "degraded"
         )
         return {
@@ -165,6 +178,8 @@ class Runtime:
             "sqlite": sqlite_ok,
             "fts": fts_ok,
             "fts_index_ready": fts_index_ready,
+            "full_report_payloads_ready": full_report_payloads_ready,
+            "full_report_payloads": full_report_payloads,
             "chroma": chroma_ok,
             "ollama": self.ollama_ready,
             "ollama_error": self.ollama_error,
@@ -196,16 +211,16 @@ class Runtime:
         for document in documents:
             document_id = str(document["id"])
             stored_path = Path(document["stored_path"])
-            if document.get("error") == "deleting" or not stored_path.is_file():
+            source_available = (
+                bool(self.storage.digest_sections(document_id))
+                if document.get("source_type") == "trading_digest"
+                else stored_path.is_file()
+            )
+            if document.get("error") == "deleting" or not source_available:
                 skipped.append(document_id)
                 continue
 
             child_ids = self.storage.child_ids_for_document(document_id)
-            await asyncio.to_thread(
-                self.index.delete,
-                child_ids,
-                document.get("collection_name"),
-            )
             self.storage.requeue_document(document_id)
             scheduled.append(document_id)
             self.logger.info(
@@ -224,6 +239,15 @@ class Runtime:
         return {"scheduled": scheduled, "skipped": skipped}
 
     async def delete_document(self, document_id: str) -> None:
+        current = self.storage.get_document(document_id)
+        if not current:
+            raise DocumentNotFoundError("Không tìm thấy tài liệu")
+        # Retained daily digests must be rejected before acquiring the PDF
+        # deletion lock; that lock deliberately changes status to `failed`.
+        if current.get("source_type") == "trading_digest":
+            raise ConflictError(
+                "Research document được giữ vĩnh viễn và không thể xóa qua API"
+            )
         document = self.storage.lock_document_for_deletion(document_id)
         if not document:
             raise DocumentNotFoundError("Không tìm thấy tài liệu")

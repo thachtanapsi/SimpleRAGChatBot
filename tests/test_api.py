@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from rag_app.api import create_app
+from rag_app.errors import GenerationTruncatedError
 
 
 class FakeLogger:
@@ -63,6 +64,16 @@ class FakeChat:
         yield {"event": "done", "data": {"answer": "answer"}}
 
 
+class TruncatedFakeChat(FakeChat):
+    async def answer(self, question, session_id, document_ids):
+        raise GenerationTruncatedError(2048)
+
+    async def stream(self, question, session_id, document_ids):
+        yield {"event": "meta", "data": {"session_id": session_id or "new-session"}}
+        yield {"event": "token", "data": {"text": "incomplete"}}
+        raise GenerationTruncatedError(2048)
+
+
 class FakeRuntime:
     def __init__(self):
         self.storage = FakeStorage()
@@ -117,6 +128,28 @@ def test_static_ui_has_no_cdn(settings):
         page = client.get("/")
         assert page.status_code == 200
         assert "cdn" not in page.text.lower()
+        assert "/static/markdown.js" in page.text
         assert "/static/app.js" in page.text
+        renderer = client.get("/static/markdown.js")
+        assert renderer.status_code == 200
+        assert "safeUrl" in renderer.text
         script = client.get("/static/app.js")
         assert "source.page_end" in script.text
+        assert "renderAssistantAnswer" in script.text
+
+
+def test_truncated_generation_has_machine_readable_error(settings):
+    runtime = FakeRuntime()
+    runtime.chat = TruncatedFakeChat()
+    app = create_app(settings, runtime)
+
+    with TestClient(app) as client:
+        answer = client.post("/api/chat", json={"question": "Question"})
+        assert answer.status_code == 503
+        assert answer.json()["code"] == "response_truncated"
+
+        stream = client.post("/api/chat/stream", json={"question": "Question"})
+        assert "event: token" in stream.text
+        assert "event: error" in stream.text
+        assert '"code":"response_truncated"' in stream.text
+        assert "event: done" not in stream.text

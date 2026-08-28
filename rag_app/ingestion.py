@@ -18,7 +18,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
 from .config import Settings
-from .errors import DuplicateDocumentError, ValidationError
+from .digests import DIGEST_CONTENT_KIND, build_digest_chunks, canonicalise_digest
+from .errors import (
+    ConflictError,
+    DocumentBusyError,
+    DuplicateDocumentError,
+    PromotionConflictError,
+    ValidationError,
+)
+from .full_reports import FULL_REPORT_V1, canonicalise_full_report
 from .storage import SQLiteStorage
 from .vector_index import ChromaIndex
 
@@ -497,6 +505,39 @@ class IngestionService:
     def set_worker_notifier(self, notifier: Callable[[], None]) -> None:
         self._wake_worker = notifier
 
+    async def put_digest_batch(
+        self,
+        *,
+        batch_id: str,
+        source: str,
+        analysis_date: str,
+        cutoff: str,
+        target_count: int,
+        research_mode: str,
+        data_provenance: str,
+    ) -> tuple[str, dict[str, Any]]:
+        """Serialize batch provenance changes with document acceptance/sealing."""
+
+        async with self._upload_lock:
+            action, batch = self.storage.create_digest_batch(
+                batch_id=batch_id,
+                source=source,
+                analysis_date=analysis_date,
+                cutoff=cutoff,
+                target_count=target_count,
+                research_mode=research_mode,
+                data_provenance=data_provenance,
+            )
+        if action in {"upgraded", "unchanged"}:
+            # Reconciliation intentionally runs after releasing the mutation
+            # lock. SQLite already owns the consistent pair and durable outbox;
+            # POST may proceed using that pair while Chroma updates in place.
+            await asyncio.to_thread(
+                self.reconcile_vector_metadata_updates,
+                batch_id=batch_id,
+            )
+        return action, batch
+
     async def accept_upload(self, upload: UploadFile) -> dict[str, Any]:
         filename = safe_pdf_name(upload.filename)
         content_type = (upload.content_type or "application/octet-stream").lower()
@@ -557,6 +598,558 @@ class IngestionService:
             temp_path.unlink(missing_ok=True)
             await upload.close()
 
+    async def accept_digest_documents(
+        self,
+        *,
+        batch_id: str,
+        batch_source: str,
+        payloads: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Queue a bounded batch of canonical digest documents idempotently."""
+
+        results: list[dict[str, Any]] = []
+        async with self._upload_lock:
+            # PUT provenance changes and sealing use this same lock. Resolve
+            # the batch and canonical hashes only after acquiring it so every
+            # validation observes one immutable pair/status snapshot.
+            batch = self.storage.get_digest_batch(batch_id)
+            if not batch:
+                from .errors import DocumentNotFoundError
+
+                raise DocumentNotFoundError("Không tìm thấy digest batch")
+            if batch["source"] != batch_source:
+                raise ValidationError("source không khớp digest batch")
+            canonical = [
+                canonicalise_digest(
+                    payload,
+                    batch_source=batch_source,
+                    batch_research_mode=str(batch["research_mode"]),
+                    batch_data_provenance=str(batch["data_provenance"]),
+                )
+                for payload in payloads
+            ]
+            seen_keys: set[str] = set()
+            seen_ranks: set[int] = set()
+            for digest in canonical:
+                if digest.source_key in seen_keys:
+                    raise ValidationError(
+                        "Một request không được chứa digest trùng identity"
+                    )
+                seen_keys.add(digest.source_key)
+                if digest.liquidity_rank is None:
+                    raise ValidationError(
+                        "liquidity_rank là bắt buộc với daily digest"
+                    )
+                if digest.liquidity_rank > int(batch["target_count"]):
+                    raise ValidationError(
+                        "liquidity_rank phải nằm trong khoảng 1..target_count"
+                    )
+                if digest.liquidity_rank in seen_ranks:
+                    raise ValidationError(
+                        "liquidity_rank bị trùng trong request"
+                    )
+                seen_ranks.add(digest.liquidity_rank)
+                if (
+                    digest.analysis_date != batch["analysis_date"]
+                    or digest.cutoff != batch["cutoff"]
+                ):
+                    raise ValidationError(
+                        "Ngày/cutoff của digest không khớp batch"
+                    )
+            current_status = self.storage.digest_batch_status(batch_id)
+            assert current_status is not None
+            existing_by_key = {
+                digest.source_key: self.storage.get_document_by_source_key(
+                    digest.source_key
+                )
+                for digest in canonical
+            }
+            if batch["status"] == "sealed":
+                return self._retry_sealed_digest_documents(
+                    batch_id=batch_id,
+                    digests=canonical,
+                    existing_by_key=existing_by_key,
+                )
+            new_count = sum(item is None for item in existing_by_key.values())
+            if current_status["accepted_count"] + new_count > int(batch["target_count"]):
+                raise ConflictError("Số digest vượt target_count của batch")
+
+            # Validate the entire request before mutating the first document.
+            for digest in canonical:
+                existing = existing_by_key[digest.source_key]
+                if existing:
+                    if existing.get("batch_id") != batch_id:
+                        raise ConflictError("Digest identity đã thuộc batch khác")
+                    if digest.source_updated_at < str(existing["source_updated_at"]):
+                        continue
+                    rank_owner = self.storage.get_digest_batch_member(
+                        batch_id, liquidity_rank=digest.liquidity_rank
+                    )
+                    if rank_owner and rank_owner["id"] != existing["id"]:
+                        raise ConflictError("liquidity_rank bị trùng trong batch")
+                    self._validate_daily_hashes(existing, digest)
+                    if existing.get("content_sha256") != digest.content_sha256:
+                        if digest.source_updated_at == str(existing["source_updated_at"]):
+                            raise DocumentBusyError(
+                                "Digest cùng source_updated_at nhưng nội dung khác nhau"
+                            )
+                        if existing["status"] == "indexing":
+                            raise DocumentBusyError("Digest đang indexing; hãy retry sau")
+                else:
+                    duplicate_ticker = self.storage.get_digest_batch_member(
+                        batch_id, ticker=digest.ticker
+                    )
+                    duplicate_rank = self.storage.get_digest_batch_member(
+                        batch_id, liquidity_rank=digest.liquidity_rank
+                    )
+                    if duplicate_ticker or duplicate_rank:
+                        raise ConflictError("ticker hoặc liquidity_rank bị trùng trong batch")
+
+            for digest in canonical:
+                existing = existing_by_key[digest.source_key]
+                if existing:
+                    if existing.get("batch_id") != batch_id:
+                        raise ConflictError("Digest identity đã thuộc batch khác")
+                    rank_owner = self.storage.get_digest_batch_member(
+                        batch_id, liquidity_rank=digest.liquidity_rank
+                    )
+                    if rank_owner and rank_owner["id"] != existing["id"]:
+                        raise ConflictError("liquidity_rank bị trùng trong batch")
+                    if digest.source_updated_at < str(existing["source_updated_at"]):
+                        results.append(
+                            {
+                                "ticker": digest.ticker,
+                                "document_id": existing["id"],
+                                "action": "stale",
+                                "status": existing["status"],
+                            }
+                        )
+                        continue
+                    if existing.get("content_sha256") == digest.content_sha256:
+                        needs_hash_backfill = (
+                            (not existing.get("identity_hash") and digest.identity_hash)
+                            or (not existing.get("digest_hash") and digest.digest_hash)
+                        )
+                        if (
+                            digest.source_updated_at
+                            > str(existing["source_updated_at"])
+                            or needs_hash_backfill
+                        ):
+                            existing = self.storage.advance_digest_source(
+                                existing["id"],
+                                batch_id=batch_id,
+                                expected_content_sha256=str(
+                                    existing["content_sha256"]
+                                ),
+                                expected_source_updated_at=str(
+                                    existing["source_updated_at"]
+                                ),
+                                allow_sealed=False,
+                                source_updated_at=digest.source_updated_at,
+                                source_run_id=digest.source_run_id,
+                                identity_hash=digest.identity_hash,
+                                digest_hash=digest.digest_hash,
+                            )
+                        if existing["status"] == "failed":
+                            existing = self.storage.requeue_daily_document(
+                                str(existing["id"]),
+                                batch_id=batch_id,
+                                expected_content_sha256=str(
+                                    existing["content_sha256"]
+                                ),
+                                expected_source_updated_at=str(
+                                    existing["source_updated_at"]
+                                ),
+                                allow_sealed=False,
+                            )
+                            status = str(existing["status"])
+                            action = "retried" if status == "pending" else "unchanged"
+                            if status == "pending":
+                                self._wake_worker()
+                        else:
+                            action = "unchanged"
+                            status = existing["status"]
+                        results.append(
+                            {
+                                "ticker": digest.ticker,
+                                "document_id": existing["id"],
+                                "action": action,
+                                "status": status,
+                            }
+                        )
+                        continue
+                    if digest.source_updated_at == str(existing["source_updated_at"]):
+                        raise DocumentBusyError(
+                            "Digest cùng source_updated_at nhưng nội dung khác nhau"
+                        )
+                    if existing["status"] == "indexing":
+                        raise DocumentBusyError("Digest đang indexing; hãy retry sau")
+                    action = "updated"
+                else:
+                    duplicate_ticker = self.storage.get_digest_batch_member(
+                        batch_id, ticker=digest.ticker
+                    )
+                    duplicate_rank = self.storage.get_digest_batch_member(
+                        batch_id, liquidity_rank=digest.liquidity_rank
+                    )
+                    if duplicate_ticker or duplicate_rank:
+                        raise ConflictError("ticker hoặc liquidity_rank bị trùng trong batch")
+                    action = "created"
+                document = self.storage.replace_digest_document(
+                    digest=digest,
+                    batch_id=batch_id,
+                    expected_existing_content_sha256=(
+                        str(existing["content_sha256"]) if existing else None
+                    ),
+                    expected_existing_source_updated_at=(
+                        str(existing["source_updated_at"]) if existing else None
+                    ),
+                )
+                results.append(
+                    {
+                        "ticker": digest.ticker,
+                        "document_id": document["id"],
+                        "action": action,
+                        "status": document["status"],
+                    }
+                )
+                self.logger.info(
+                    "digest queued",
+                    extra={
+                        "event": "digest_queued",
+                        "document_id": document["id"],
+                        "ticker": digest.ticker,
+                        "batch_id": batch_id,
+                        "action": action,
+                    },
+                )
+        if any(item["action"] in {"created", "updated", "retried"} for item in results):
+            self._wake_worker()
+        return results
+
+    @staticmethod
+    def _validate_daily_hashes(existing: dict[str, Any], digest: Any) -> None:
+        """Never let an exact-text retry rewrite immutable promotion anchors."""
+
+        if existing.get("content_kind") != DIGEST_CONTENT_KIND:
+            raise ConflictError("Không thể ghi đè Full Analysis bằng daily digest")
+        for field in ("identity_hash", "digest_hash"):
+            stored = existing.get(field)
+            incoming = getattr(digest, field)
+            if stored and incoming and str(stored) != str(incoming):
+                raise ConflictError(f"{field} không khớp digest hiện tại")
+
+    async def accept_full_report_promotions(
+        self,
+        *,
+        batch_id: str,
+        payloads: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Promote sealed daily documents to Full Analysis without changing identity.
+
+        SQLite replacement and the old-vector deletion outbox commit together.
+        Chroma is then replaced by the ordinary crash-recoverable writer.
+        """
+
+        results: list[dict[str, Any]] = []
+        promoted = False
+        async with self._upload_lock:
+            batch = self.storage.get_digest_batch(batch_id)
+            if not batch:
+                from .errors import DocumentNotFoundError
+
+                raise DocumentNotFoundError("Không tìm thấy digest batch")
+            if batch["status"] != "sealed":
+                raise ConflictError("Chỉ promote Full Analysis sau khi batch đã seal")
+            reports = [canonicalise_full_report(payload) for payload in payloads]
+            service_secret = self.settings.rag_service_api_key
+            if service_secret and len(service_secret) >= 8 and any(
+                service_secret in text
+                for report in reports
+                for text in report.sections.values()
+            ):
+                raise ValidationError(
+                    "Full Analysis section chứa credential được cấu hình"
+                )
+            seen_keys: set[str] = set()
+            seen_ranks: set[int] = set()
+            for report in reports:
+                if report.source_key in seen_keys:
+                    raise ValidationError(
+                        "Một request không được chứa Full Analysis trùng identity"
+                    )
+                seen_keys.add(report.source_key)
+                if report.liquidity_rank in seen_ranks:
+                    raise ValidationError("liquidity_rank bị trùng trong request")
+                seen_ranks.add(report.liquidity_rank)
+                if report.source != batch["source"]:
+                    raise ValidationError("source không khớp digest batch")
+                if (
+                    report.analysis_date != batch["analysis_date"]
+                    or report.cutoff != batch["cutoff"]
+                ):
+                    raise ValidationError(
+                        "Ngày/cutoff của Full Analysis không khớp batch"
+                    )
+                if report.liquidity_rank > int(batch["target_count"]):
+                    raise ValidationError(
+                        "liquidity_rank phải nằm trong khoảng 1..target_count"
+                    )
+                if (
+                    report.research_mode != batch["research_mode"]
+                    or report.data_provenance != batch["data_provenance"]
+                ):
+                    raise ValidationError(
+                        "Provenance của Full Analysis không khớp digest batch"
+                    )
+
+            for report in reports:
+                existing = self.storage.get_document_by_source_key(report.source_key)
+                base = {
+                    "ticker": report.ticker,
+                    "document_id": str(existing["id"]) if existing else report.document_id,
+                    "full_report_hash": report.full_report_hash,
+                }
+
+                def reject(error_code: str) -> None:
+                    results.append(
+                        {
+                            **base,
+                            "action": "conflict",
+                            "status": str(existing.get("status") if existing else "missing"),
+                            "error_code": error_code,
+                        }
+                    )
+
+                if not existing or existing.get("batch_id") != batch_id:
+                    reject("parent_digest_not_found")
+                    continue
+                if existing.get("content_kind") == FULL_REPORT_V1:
+                    exact = (
+                        existing.get("full_report_hash") == report.full_report_hash
+                        and existing.get("identity_hash") == report.identity_hash
+                        and existing.get("parent_identity_hash")
+                        == report.parent_identity_hash
+                        and existing.get("expected_digest_hash")
+                        == report.expected_digest_hash
+                        and int(existing.get("execution_generation") or 0)
+                        == report.execution_generation
+                    )
+                    if exact:
+                        replay_status = str(existing["status"])
+                        if existing["status"] == "failed":
+                            existing = self.storage.requeue_full_report(
+                                str(existing["id"]),
+                                batch_id=batch_id,
+                                digest=report,
+                            )
+                            replay_status = str(existing["status"])
+                            promoted = replay_status == "pending"
+                        elif existing["status"] == "pending":
+                            # A replay after process crash must wake the writer
+                            # even though the immutable Full Analysis is a no-op.
+                            promoted = True
+                        results.append(
+                            {
+                                **base,
+                                "action": "unchanged",
+                                "status": replay_status,
+                            }
+                        )
+                    else:
+                        reject("full_report_already_promoted")
+                    continue
+                if existing.get("content_kind") != DIGEST_CONTENT_KIND:
+                    reject("parent_content_kind_invalid")
+                    continue
+                if not existing.get("identity_hash") or not existing.get("digest_hash"):
+                    reject("parent_promotion_hash_missing")
+                    continue
+                if existing.get("identity_hash") != report.parent_identity_hash:
+                    reject("parent_identity_hash_mismatch")
+                    continue
+                if existing.get("digest_hash") != report.expected_digest_hash:
+                    reject("expected_digest_hash_mismatch")
+                    continue
+                if (
+                    existing.get("ticker") != report.ticker
+                    or existing.get("analysis_date") != report.analysis_date
+                    or existing.get("analysis_cutoff") != report.cutoff
+                    or int(existing.get("liquidity_rank") or 0)
+                    != report.liquidity_rank
+                    or existing.get("research_mode") != report.research_mode
+                    or existing.get("data_provenance") != report.data_provenance
+                ):
+                    reject("parent_identity_mismatch")
+                    continue
+                if report.source_updated_at <= str(existing["source_updated_at"]):
+                    results.append(
+                        {
+                            **base,
+                            "action": "stale",
+                            "status": str(existing["status"]),
+                            "error_code": "source_updated_at_not_newer",
+                        }
+                    )
+                    continue
+                if existing["status"] == "indexing":
+                    reject("parent_document_busy")
+                    continue
+                try:
+                    document = self.storage.replace_digest_document(
+                        digest=report,
+                        batch_id=batch_id,
+                        require_daily_parent=True,
+                    )
+                except DocumentBusyError:
+                    existing = self.storage.get_document_by_source_key(
+                        report.source_key
+                    )
+                    reject("parent_document_busy")
+                    continue
+                except PromotionConflictError as exc:
+                    existing = self.storage.get_document_by_source_key(
+                        report.source_key
+                    )
+                    if exc.error_code == "source_updated_at_not_newer":
+                        results.append(
+                            {
+                                **base,
+                                "action": "stale",
+                                "status": str(
+                                    existing.get("status") if existing else "missing"
+                                ),
+                                "error_code": exc.error_code,
+                            }
+                        )
+                    else:
+                        reject(exc.error_code)
+                    continue
+                storage_action = str(document.pop("_promotion_action", "promoted"))
+                if storage_action == "unchanged" and document["status"] == "failed":
+                    document = self.storage.requeue_full_report(
+                        str(document["id"]),
+                        batch_id=batch_id,
+                        digest=report,
+                    )
+                if storage_action == "promoted" or document["status"] in {
+                    "pending",
+                }:
+                    promoted = True
+                results.append(
+                    {
+                        **base,
+                        "document_id": str(document["id"]),
+                        "action": storage_action,
+                        "status": str(document["status"]),
+                    }
+                )
+                self.logger.info(
+                    "full analysis queued",
+                    extra={
+                        "event": "full_analysis_queued",
+                        "document_id": document["id"],
+                        "ticker": report.ticker,
+                        "batch_id": batch_id,
+                    },
+                )
+        if promoted:
+            self._wake_worker()
+        return results
+
+    def _retry_sealed_digest_documents(
+        self,
+        *,
+        batch_id: str,
+        digests: Sequence[Any],
+        existing_by_key: dict[str, dict[str, Any] | None],
+    ) -> list[dict[str, Any]]:
+        """Allow an exact failed document to recover after an immutable seal.
+
+        Sealing closes membership and content changes, but indexing can fail
+        later.  Without this narrow retry path a transient embedding/Chroma
+        outage would leave a sealed batch permanently unrecoverable.
+        """
+
+        for digest in digests:
+            existing = existing_by_key[digest.source_key]
+            if (
+                not existing
+                or existing.get("batch_id") != batch_id
+                or existing.get("content_sha256") != digest.content_sha256
+            ):
+                raise ConflictError(
+                    "Digest batch đã seal; chỉ cho phép retry đúng nội dung hiện tại"
+                )
+            self._validate_daily_hashes(existing, digest)
+
+        results: list[dict[str, Any]] = []
+        wake = False
+        for digest in digests:
+            existing = existing_by_key[digest.source_key]
+            assert existing is not None
+            if digest.source_updated_at < str(existing["source_updated_at"]):
+                action = "stale"
+                status = str(existing["status"])
+            else:
+                needs_hash_backfill = (
+                    (not existing.get("identity_hash") and digest.identity_hash)
+                    or (not existing.get("digest_hash") and digest.digest_hash)
+                )
+                if (
+                    digest.source_updated_at > str(existing["source_updated_at"])
+                    or needs_hash_backfill
+                ):
+                    existing = self.storage.advance_digest_source(
+                        existing["id"],
+                        batch_id=batch_id,
+                        expected_content_sha256=str(existing["content_sha256"]),
+                        expected_source_updated_at=str(
+                            existing["source_updated_at"]
+                        ),
+                        allow_sealed=True,
+                        source_updated_at=digest.source_updated_at,
+                        source_run_id=digest.source_run_id,
+                        identity_hash=digest.identity_hash,
+                        digest_hash=digest.digest_hash,
+                    )
+                if existing["status"] == "failed":
+                    existing = self.storage.requeue_daily_document(
+                        str(existing["id"]),
+                        batch_id=batch_id,
+                        expected_content_sha256=str(existing["content_sha256"]),
+                        expected_source_updated_at=str(
+                            existing["source_updated_at"]
+                        ),
+                        allow_sealed=True,
+                    )
+                    status = str(existing["status"])
+                    if status == "pending":
+                        action, wake = "retried", True
+                    else:
+                        action = "unchanged"
+                else:
+                    action, status = "unchanged", str(existing["status"])
+            results.append(
+                {
+                    "ticker": digest.ticker,
+                    "document_id": existing["id"],
+                    "action": action,
+                    "status": status,
+                }
+            )
+        if wake:
+            self._wake_worker()
+        return results
+
+    async def seal_digest_batch(
+        self, batch_id: str
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Serialize sealing with digest upserts in the single-writer process."""
+
+        async with self._upload_lock:
+            return self.storage.seal_digest_batch(batch_id)
+
     def seed_papers_once(self) -> int:
         if self.storage.get_meta("papers_seeded") == "1":
             return 0
@@ -599,35 +1192,67 @@ class IngestionService:
         document_id = document["id"]
         child_ids: list[str] = []
         try:
-            reader = PdfReader(document["stored_path"], strict=False)
-            pages = [(page.extract_text() or "").strip() for page in reader.pages]
-            if sum(len(text) for text in pages) < self.settings.min_pdf_text_chars:
-                raise ValidationError("PDF scan/ảnh chưa được hỗ trợ; cần OCR trước")
-            layout_pages: list[str] = []
-            for page, fallback_text in zip(reader.pages, pages):
-                try:
-                    layout_pages.append(
-                        (page.extract_text(extraction_mode="layout") or "").strip()
+            self._delete_superseded_vectors(document_id)
+            if document.get("source_type") == "trading_digest":
+                sections = self.storage.digest_sections(document_id)
+                if document.get("content_kind") == FULL_REPORT_V1:
+                    decision_section = self.storage.structured_decision_section(
+                        document_id
                     )
-                except Exception:
-                    # Layout chỉ hỗ trợ heuristic bảng; text thường vẫn đủ để
-                    # index và phát hiện đoạn văn tiếp nối.
-                    layout_pages.append(fallback_text)
-            parents, children, child_texts, metadata = build_parent_child_chunks(
-                file_hash=document["sha256"],
-                filename=document["filename"],
-                pages=pages,
-                settings=self.settings,
-                layout_pages=layout_pages,
-            )
-            if not children:
-                raise ValidationError("PDF không có nội dung text có thể index")
+                    if decision_section is None:
+                        raise ValidationError(
+                            "Full Analysis chưa có canonical payload"
+                        )
+                    sections.append(decision_section)
+                parents, children, child_texts, metadata = build_digest_chunks(
+                    document=document,
+                    sections=sections,
+                    settings=self.settings,
+                )
+                page_count = 0
+                if not children:
+                    raise ValidationError("Digest không có nội dung có thể index")
+            else:
+                reader = PdfReader(document["stored_path"], strict=False)
+                pages = [(page.extract_text() or "").strip() for page in reader.pages]
+                if sum(len(text) for text in pages) < self.settings.min_pdf_text_chars:
+                    raise ValidationError("PDF scan/ảnh chưa được hỗ trợ; cần OCR trước")
+                layout_pages: list[str] = []
+                for page, fallback_text in zip(reader.pages, pages):
+                    try:
+                        layout_pages.append(
+                            (page.extract_text(extraction_mode="layout") or "").strip()
+                        )
+                    except Exception:
+                        # Layout chỉ hỗ trợ heuristic bảng; text thường vẫn đủ để
+                        # index và phát hiện đoạn văn tiếp nối.
+                        layout_pages.append(fallback_text)
+                parents, children, child_texts, metadata = build_parent_child_chunks(
+                    file_hash=document["sha256"],
+                    filename=document["filename"],
+                    pages=pages,
+                    settings=self.settings,
+                    layout_pages=layout_pages,
+                )
+                page_count = len(pages)
+                for item in metadata:
+                    item["source_type"] = "pdf"
+                    item["content_kind"] = "pdf"
+                    item["report_schema"] = "pdf"
+                    item["research_mode"] = str(
+                        document.get("research_mode") or "legacy_unknown"
+                    )
+                    item["data_provenance"] = str(
+                        document.get("data_provenance") or "legacy_unknown"
+                    )
+                if not children:
+                    raise ValidationError("PDF không có nội dung text có thể index")
             child_ids = [child["id"] for child in children]
             self.index.add_children(ids=child_ids, texts=child_texts, metadatas=metadata)
             try:
                 self.storage.finish_indexing(
                     document_id=document_id,
-                    page_count=len(pages),
+                    page_count=page_count,
                     parents=parents,
                     children=children,
                     fingerprint=self.index_fingerprint,
@@ -636,6 +1261,10 @@ class IngestionService:
             except Exception:
                 self.index.delete(child_ids)
                 raise
+            # A batch may have acquired provenance while this document was
+            # already indexing with a legacy snapshot.  The durable metadata
+            # outbox makes this in-place correction idempotent and crash-safe.
+            self.reconcile_vector_metadata_updates(document_id)
             self.logger.info(
                 "document ready",
                 extra={
@@ -650,7 +1279,17 @@ class IngestionService:
             )
         except Exception as exc:
             if child_ids:
-                self.index.delete(child_ids)
+                try:
+                    self.index.delete(child_ids)
+                except Exception as cleanup_exc:
+                    self.logger.error(
+                        "index cleanup failed",
+                        extra={
+                            "event": "index_cleanup_failed",
+                            "document_id": document_id,
+                            "error": type(cleanup_exc).__name__,
+                        },
+                    )
             public_error = (
                 str(exc) if isinstance(exc, ValidationError) else type(exc).__name__
             )
@@ -660,12 +1299,85 @@ class IngestionService:
                 extra={"event": "index_failed", "document_id": document_id, "error": type(exc).__name__},
             )
 
+    def _delete_superseded_vectors(self, document_id: str) -> None:
+        """Drain the durable vector-deletion outbox before indexing new chunks."""
+
+        for deletion in self.storage.pending_vector_deletions(document_id):
+            child_ids = list(deletion["child_ids"])
+            stored_collection = str(deletion["collection_name"])
+            self.index.delete(child_ids, stored_collection or self.collection_name)
+            self.storage.finish_vector_deletion(
+                document_id, stored_collection, child_ids
+            )
+
+    def reconcile_vector_metadata_updates(
+        self,
+        document_id: str | None = None,
+        *,
+        batch_id: str | None = None,
+    ) -> int:
+        """Apply durable provenance updates without recomputing embeddings."""
+
+        completed = 0
+        try:
+            updates = self.storage.pending_vector_metadata_updates(
+                document_id, batch_id=batch_id
+            )
+        except Exception as exc:
+            self.logger.error(
+                "vector provenance reconciliation scan failed",
+                extra={
+                    "event": "vector_provenance_reconciliation_scan_failed",
+                    "error": type(exc).__name__,
+                },
+            )
+            return 0
+        for update in updates:
+            try:
+                if update["status"] != "ready" or not update.get("collection_name"):
+                    continue
+                child_ids = self.storage.child_ids_for_document(
+                    update["document_id"]
+                )
+                if not child_ids:
+                    continue
+                applied = self.index.update_provenance(
+                    child_ids,
+                    str(update["research_mode"]),
+                    str(update["data_provenance"]),
+                    str(update["collection_name"]),
+                )
+                if not applied:
+                    continue
+                self.storage.finish_vector_metadata_update(
+                    str(update["document_id"]),
+                    str(update["research_mode"]),
+                    str(update["data_provenance"]),
+                )
+                completed += 1
+            except Exception as exc:
+                self.logger.error(
+                    "vector provenance reconciliation failed",
+                    extra={
+                        "event": "vector_provenance_reconciliation_failed",
+                        "document_id": update["document_id"],
+                        "error": type(exc).__name__,
+                    },
+                )
+        return completed
+
     def process_next(self) -> bool:
         document = self.storage.claim_next_pending()
         if not document:
             return False
         self.process_document(document)
         return True
+
+    def process_pending_batch(self) -> int:
+        documents = self.storage.claim_pending(self.settings.digest_writer_claim_size)
+        for document in documents:
+            self.process_document(document)
+        return len(documents)
 
 
 class IngestionWorker:
@@ -697,7 +1409,10 @@ class IngestionWorker:
 
     async def _run(self) -> None:
         while True:
-            processed = await asyncio.to_thread(self.ingestion.process_next)
+            await asyncio.to_thread(
+                self.ingestion.reconcile_vector_metadata_updates
+            )
+            processed = await asyncio.to_thread(self.ingestion.process_pending_batch)
             if processed:
                 continue
             self._event.clear()

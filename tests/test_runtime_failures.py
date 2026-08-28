@@ -60,6 +60,14 @@ class HealthStorage:
     def fts_count(self):
         return 2
 
+    def full_report_payload_health(self):
+        return {
+            "full_reports": 0,
+            "missing_ready_payloads": 0,
+            "pending_ready_decision_indexes": 0,
+            "partial_decisions": 0,
+        }
+
 
 class HealthIndex:
     def healthcheck(self):
@@ -86,5 +94,6 @@ async def test_health_reports_embedding_and_fts_state(settings):
 
     assert health["status"] == "ok"
     assert health["fts_index_ready"] is True
+    assert health["full_report_payloads_ready"] is True
     assert health["embedding_device"] == "cpu"
     assert health["embedding_dimension"] == 1024

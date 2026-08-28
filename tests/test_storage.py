@@ -73,7 +73,74 @@ def test_schema_v2_parent_child_rows_migrate_to_page_ranges(settings):
         ).fetchone()[0]
     assert parent == (3, 3, "page")
     assert child == (3, 3, "page")
-    assert version == "3"
+    assert version == "7"
+
+
+def test_digest_provenance_columns_migrate_without_replacing_legacy_rows(settings):
+    settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(settings.sqlite_path) as db:
+        db.executescript(
+            """
+            CREATE TABLE documents (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                sha256 TEXT NOT NULL UNIQUE,
+                stored_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                page_count INTEGER,
+                status TEXT NOT NULL,
+                error TEXT,
+                index_fingerprint TEXT,
+                collection_name TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO documents(
+                id, filename, sha256, stored_path, size_bytes, page_count,
+                status, created_at, updated_at
+            ) VALUES (
+                'legacy-pdf', 'legacy.pdf', 'legacy-sha', '/old/legacy.pdf',
+                10, 1, 'ready', 'old', 'old'
+            );
+            CREATE TABLE digest_batches (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                analysis_date TEXT NOT NULL,
+                cutoff TEXT NOT NULL,
+                target_count INTEGER NOT NULL DEFAULT 500,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                sealed_at TEXT
+            );
+            INSERT INTO digest_batches(
+                id, source, analysis_date, cutoff, target_count, status,
+                created_at, updated_at
+            ) VALUES (
+                'legacy-batch', 'tradingagents_daily_research', '2026-08-20',
+                '2026-08-20T16:45:00+07:00', 1, 'sealed', 'old', 'old'
+            );
+            """
+        )
+
+    storage = SQLiteStorage(settings.sqlite_path)
+    storage.initialise()
+    migrated = storage.get_digest_batch("legacy-batch")
+    assert migrated["research_mode"] == "legacy_unknown"
+    assert migrated["data_provenance"] == "legacy_unknown"
+    assert migrated["status"] == "sealed"
+    legacy_pdf = storage.get_document("legacy-pdf")
+    assert legacy_pdf["source_type"] == "pdf"
+    assert legacy_pdf["research_mode"] == "legacy_unknown"
+    assert legacy_pdf["data_provenance"] == "legacy_unknown"
+    assert legacy_pdf["content_kind"] == "pdf"
+    assert legacy_pdf["report_schema"] == "pdf"
+    assert "expected_digest_hash" in legacy_pdf
+    with sqlite3.connect(settings.sqlite_path) as db:
+        version = db.execute(
+            "SELECT value FROM app_meta WHERE key='digest_schema_version'"
+        ).fetchone()[0]
+    assert version == "6"
 
 
 def test_interrupted_job_returns_to_pending(settings, tmp_path):

@@ -7,8 +7,8 @@ import pytest
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, AIMessageChunk
 
-from rag_app.chat import ChatService, validate_citations
-from rag_app.errors import ServiceUnavailableError
+from rag_app.chat import ChatService, generation_was_truncated, validate_citations
+from rag_app.errors import GenerationTruncatedError, ServiceUnavailableError
 from rag_app.evaluation import is_abstention, page_range_matches, percentile_95
 from rag_app.retrieval import ParentChildRetriever, RetrievedSource, format_context
 
@@ -228,9 +228,11 @@ class FakeRetriever:
     def __init__(self, sources=None):
         self.sources = [source()] if sources is None else sources
         self.query = None
+        self.options = None
 
-    def retrieve(self, query, _document_ids):
+    def retrieve(self, query, _document_ids, **options):
         self.query = query
+        self.options = options
         return self.sources
 
 
@@ -249,6 +251,21 @@ class FakeLLM:
         yield AIMessageChunk(content="[1]")
 
 
+class TruncatedLLM:
+    async def ainvoke(self, _messages):
+        return AIMessage(
+            content="Incomplete answer",
+            response_metadata={"done_reason": "length", "eval_count": 2048},
+        )
+
+    async def astream(self, _messages):
+        yield AIMessageChunk(content="Incomplete answer")
+        yield AIMessageChunk(
+            content="",
+            response_metadata={"done_reason": "length", "eval_count": 2048},
+        )
+
+
 @pytest.mark.asyncio
 async def test_query_rewrite_then_validated_answer(settings):
     storage = ChatStorage(history=[{"role": "user", "content": "Earlier"}])
@@ -257,6 +274,7 @@ async def test_query_rewrite_then_validated_answer(settings):
     service = ChatService(settings, storage, retriever, llm, asyncio.Semaphore(1))
     result = await service.answer("What about it?", "session")
     assert retriever.query == "Standalone query"
+    assert retriever.options == {"filters": None, "restrict_document_ids": False}
     assert result["answer"] == "Grounded [1] fake."
     assert result["citations"][0]["cited"] is True
     assert len(storage.exchanges) == 1
@@ -284,6 +302,58 @@ async def test_closed_stream_does_not_save_partial_assistant(settings):
     assert (await anext(stream))["event"] == "meta"
     assert (await anext(stream))["event"] == "token"
     await stream.aclose()
+    assert storage.exchanges == []
+
+
+def test_generation_limit_detection_prefers_explicit_stop_reason():
+    complete = AIMessage(
+        content="Complete",
+        response_metadata={"done_reason": "stop", "eval_count": 2048},
+    )
+    missing_reason = AIMessage(
+        content="Incomplete",
+        response_metadata={"eval_count": 2048},
+    )
+
+    assert generation_was_truncated(complete, 2048) is False
+    assert generation_was_truncated(missing_reason, 2048) is True
+
+
+@pytest.mark.asyncio
+async def test_truncated_answer_is_not_saved(settings):
+    storage = ChatStorage()
+    service = ChatService(
+        settings,
+        storage,
+        FakeRetriever(),
+        TruncatedLLM(),
+        asyncio.Semaphore(1),
+    )
+
+    with pytest.raises(GenerationTruncatedError) as error:
+        await service.answer("Question", "session")
+
+    assert error.value.error_code == "response_truncated"
+    assert storage.exchanges == []
+
+
+@pytest.mark.asyncio
+async def test_truncated_stream_emits_no_done_and_is_not_saved(settings):
+    storage = ChatStorage()
+    service = ChatService(
+        settings,
+        storage,
+        FakeRetriever(),
+        TruncatedLLM(),
+        asyncio.Semaphore(1),
+    )
+    stream = service.stream("Question", "session")
+
+    assert (await anext(stream))["event"] == "meta"
+    assert (await anext(stream))["event"] == "token"
+    with pytest.raises(GenerationTruncatedError):
+        await anext(stream)
+
     assert storage.exchanges == []
 
 
