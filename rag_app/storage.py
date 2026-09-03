@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -57,6 +58,13 @@ def build_fts_query(text: str) -> str:
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _stable_storage_id(prefix: str, *parts: object) -> str:
+    encoded = json.dumps(
+        parts, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return f"{prefix}_{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _document_filter_sql(
@@ -316,6 +324,141 @@ class SQLiteStorage:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS digest_claims (
+                    id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL
+                        REFERENCES documents(id) ON DELETE CASCADE,
+                    section TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    confidence_json TEXT,
+                    evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(document_id, section, position)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_digest_claims_document
+                    ON digest_claims(document_id, section, position);
+
+                CREATE TABLE IF NOT EXISTS graph_builds (
+                    id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL
+                        REFERENCES documents(id) ON DELETE CASCADE,
+                    content_sha256 TEXT NOT NULL,
+                    index_fingerprint TEXT NOT NULL,
+                    extractor_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('pending', 'building', 'ready', 'failed', 'stale')
+                    ),
+                    active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    UNIQUE(
+                        document_id, content_sha256,
+                        index_fingerprint, extractor_fingerprint
+                    )
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_graph_builds_status
+                    ON graph_builds(status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_graph_builds_document
+                    ON graph_builds(document_id, status, active);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_builds_one_active
+                    ON graph_builds(document_id) WHERE active=1;
+
+                CREATE TABLE IF NOT EXISTS graph_entities (
+                    id TEXT PRIMARY KEY,
+                    entity_type TEXT NOT NULL,
+                    canonical_key TEXT NOT NULL,
+                    canonical_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(entity_type, canonical_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_graph_entities_key
+                    ON graph_entities(canonical_key, entity_type);
+
+                CREATE TABLE IF NOT EXISTS graph_mentions (
+                    id TEXT PRIMARY KEY,
+                    build_id TEXT NOT NULL
+                        REFERENCES graph_builds(id) ON DELETE CASCADE,
+                    entity_id TEXT NOT NULL
+                        REFERENCES graph_entities(id) ON DELETE CASCADE,
+                    parent_id TEXT NOT NULL
+                        REFERENCES parents(id) ON DELETE CASCADE,
+                    surface TEXT NOT NULL,
+                    alias_key TEXT NOT NULL,
+                    start_offset INTEGER NOT NULL CHECK (start_offset >= 0),
+                    end_offset INTEGER NOT NULL CHECK (end_offset >= start_offset),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(build_id, parent_id, entity_id, start_offset, end_offset)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_graph_mentions_entity
+                    ON graph_mentions(entity_id, alias_key);
+                CREATE INDEX IF NOT EXISTS idx_graph_mentions_build
+                    ON graph_mentions(build_id, parent_id);
+
+                CREATE TABLE IF NOT EXISTS graph_assertions (
+                    id TEXT PRIMARY KEY,
+                    build_id TEXT NOT NULL
+                        REFERENCES graph_builds(id) ON DELETE CASCADE,
+                    document_id TEXT NOT NULL
+                        REFERENCES documents(id) ON DELETE CASCADE,
+                    subject_entity_id TEXT NOT NULL
+                        REFERENCES graph_entities(id) ON DELETE CASCADE,
+                    predicate TEXT NOT NULL,
+                    object_entity_id TEXT
+                        REFERENCES graph_entities(id) ON DELETE CASCADE,
+                    object_literal TEXT,
+                    object_type TEXT,
+                    modality TEXT NOT NULL DEFAULT 'asserted',
+                    valid_at TEXT,
+                    confidence REAL NOT NULL DEFAULT 1.0
+                        CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                    created_at TEXT NOT NULL,
+                    CHECK (
+                        (object_entity_id IS NOT NULL AND object_literal IS NULL)
+                        OR
+                        (object_entity_id IS NULL AND object_literal IS NOT NULL)
+                    )
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_graph_assertions_subject
+                    ON graph_assertions(subject_entity_id, predicate, build_id);
+                CREATE INDEX IF NOT EXISTS idx_graph_assertions_object
+                    ON graph_assertions(object_entity_id, predicate, build_id)
+                    WHERE object_entity_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_graph_assertions_document
+                    ON graph_assertions(document_id, build_id);
+
+                CREATE TABLE IF NOT EXISTS graph_evidence (
+                    id TEXT PRIMARY KEY,
+                    build_id TEXT NOT NULL
+                        REFERENCES graph_builds(id) ON DELETE CASCADE,
+                    assertion_id TEXT NOT NULL
+                        REFERENCES graph_assertions(id) ON DELETE CASCADE,
+                    parent_id TEXT NOT NULL
+                        REFERENCES parents(id) ON DELETE CASCADE,
+                    child_id TEXT REFERENCES children(id) ON DELETE SET NULL,
+                    quote TEXT NOT NULL,
+                    quote_sha256 TEXT NOT NULL,
+                    start_offset INTEGER NOT NULL CHECK (start_offset >= 0),
+                    end_offset INTEGER NOT NULL CHECK (end_offset >= start_offset),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(assertion_id, parent_id, start_offset, end_offset)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_graph_evidence_assertion
+                    ON graph_evidence(assertion_id, parent_id);
+                CREATE INDEX IF NOT EXISTS idx_graph_evidence_parent
+                    ON graph_evidence(parent_id, build_id);
                 """
             )
             document_columns = {
@@ -487,14 +630,45 @@ class SQLiteStorage:
                 )
             except sqlite3.OperationalError as exc:
                 raise RuntimeError("SQLite hiện tại không hỗ trợ FTS5") from exc
+            try:
+                db.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS graph_entity_fts USING fts5(
+                        entity_id UNINDEXED,
+                        canonical_key,
+                        canonical_name,
+                        aliases,
+                        tokenize='unicode61 remove_diacritics 2'
+                    )
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                raise RuntimeError("SQLite hiện tại không hỗ trợ FTS5") from exc
             db.execute(
-                "INSERT INTO app_meta(key, value) VALUES ('schema_version', '7') "
+                "INSERT INTO app_meta(key, value) VALUES ('schema_version', '8') "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
             db.execute(
                 "INSERT INTO app_meta(key, value) VALUES ('digest_schema_version', '6') "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
+            db.execute(
+                "INSERT INTO app_meta(key, value) VALUES ('graph_schema_version', '1') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+
+    @staticmethod
+    def _stale_graph_builds(db: sqlite3.Connection, document_id: str) -> int:
+        """Deactivate derived graph state in the caller's document transaction."""
+
+        return db.execute(
+            """
+            UPDATE graph_builds
+            SET status='stale', active=0, updated_at=?
+            WHERE document_id=? AND status <> 'stale'
+            """,
+            (utc_now(), document_id),
+        ).rowcount
 
     def healthcheck(self) -> bool:
         with self.connect() as db:
@@ -580,6 +754,22 @@ class SQLiteStorage:
                 "SELECT * FROM documents WHERE status='ready' ORDER BY created_at"
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def list_ready_tickers(self) -> list[str]:
+        """Return canonical tickers backed by ready documents in stable order."""
+
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT ticker FROM documents "
+                "WHERE status='ready' AND ticker IS NOT NULL"
+            ).fetchall()
+        return sorted(
+            {
+                canonical
+                for row in rows
+                if (canonical := str(row["ticker"]).strip().upper())
+            }
+        )
 
     def list_documents_page(
         self,
@@ -1126,6 +1316,8 @@ class SQLiteStorage:
                 db.execute("DELETE FROM children WHERE document_id=?", (document_id,))
                 db.execute("DELETE FROM parents WHERE document_id=?", (document_id,))
                 db.execute("DELETE FROM digest_sections WHERE document_id=?", (document_id,))
+                db.execute("DELETE FROM digest_claims WHERE document_id=?", (document_id,))
+                self._stale_graph_builds(db, document_id)
                 db.execute(
                     """
                     UPDATE documents SET filename=:filename, sha256=:sha256, stored_path='',
@@ -1203,6 +1395,50 @@ class SQLiteStorage:
                     )
                     for position, section in enumerate(digest.sections)
                 ],
+            )
+            claim_rows: list[tuple[Any, ...]] = []
+            for section, claims in (getattr(digest, "claims", {}) or {}).items():
+                for position, claim in enumerate(claims):
+                    claim_text = str(claim["text"])
+                    evidence_ids = list(claim.get("evidence_ids") or [])
+                    claim_rows.append(
+                        (
+                            _stable_storage_id(
+                                "digest_claim",
+                                document_id,
+                                section,
+                                position,
+                                claim_text,
+                                claim.get("confidence"),
+                                evidence_ids,
+                            ),
+                            document_id,
+                            section,
+                            position,
+                            claim_text,
+                            json.dumps(
+                                claim.get("confidence"),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            if claim.get("confidence") is not None
+                            else None,
+                            json.dumps(
+                                evidence_ids,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                            now,
+                        )
+                    )
+            db.executemany(
+                """
+                INSERT INTO digest_claims(
+                    id, document_id, section, position, text,
+                    confidence_json, evidence_ids_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                claim_rows,
             )
             self._upsert_full_report_payload(
                 db,
@@ -1519,6 +1755,7 @@ class SQLiteStorage:
                 db.execute(
                     "DELETE FROM parents WHERE document_id=?", (document_id,)
                 )
+                self._stale_graph_builds(db, document_id)
                 db.execute(
                     """
                     UPDATE documents SET status='pending', error=NULL,
@@ -1579,6 +1816,7 @@ class SQLiteStorage:
                 db.execute(
                     "DELETE FROM parents WHERE document_id=?", (document_id,)
                 )
+                self._stale_graph_builds(db, document_id)
                 db.execute(
                     """
                     UPDATE documents SET status='pending', error=NULL,
@@ -1602,6 +1840,31 @@ class SQLiteStorage:
                 (document_id,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def digest_claims(self, document_id: str) -> list[dict[str, Any]]:
+        """Return typed daily claims without exposing producer-only fields."""
+
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT id, document_id, section, position, text,
+                       confidence_json, evidence_ids_json, created_at
+                FROM digest_claims
+                WHERE document_id=?
+                ORDER BY section, position
+                """,
+                (document_id,),
+            ).fetchall()
+        claims: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            confidence_json = item.pop("confidence_json")
+            item["confidence"] = (
+                json.loads(confidence_json) if confidence_json is not None else None
+            )
+            item["evidence_ids"] = json.loads(item.pop("evidence_ids_json"))
+            claims.append(item)
+        return claims
 
     def get_full_report_payload(self, document_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -1883,6 +2146,7 @@ class SQLiteStorage:
             db.execute("DELETE FROM child_fts WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM children WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM parents WHERE document_id=?", (document_id,))
+            self._stale_graph_builds(db, document_id)
             db.execute(
                 "UPDATE documents SET status='failed', error=?, updated_at=? WHERE id=?",
                 (error_code[:200], utc_now(), document_id),
@@ -1924,6 +2188,7 @@ class SQLiteStorage:
             db.execute("DELETE FROM child_fts WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM children WHERE document_id=?", (document_id,))
             db.execute("DELETE FROM parents WHERE document_id=?", (document_id,))
+            self._stale_graph_builds(db, document_id)
             db.execute(
                 """
                 UPDATE documents SET status='pending', error=NULL,
@@ -1997,7 +2262,7 @@ class SQLiteStorage:
             rows = db.execute(
                 f"""
                 SELECT f.child_id, f.parent_id, f.document_id,
-                       bm25(child_fts) AS lexical_score
+                       c.text AS text, bm25(child_fts) AS lexical_score
                 FROM child_fts f
                 JOIN children c ON c.id=f.child_id
                 JOIN documents d ON d.id=f.document_id
@@ -2030,6 +2295,7 @@ class SQLiteStorage:
                 return None
             document = dict(row)
             if document["status"] != "indexing":
+                self._stale_graph_builds(db, document_id)
                 db.execute(
                     "UPDATE documents SET status='failed', error='deleting', updated_at=? "
                     "WHERE id=?",
@@ -2059,6 +2325,70 @@ class SQLiteStorage:
                 tuple(params),
             ).fetchall()
             return [row["id"] for row in rows]
+
+    def latest_ready_document_ids(self, allowed_ids: Sequence[str]) -> list[str]:
+        """Narrow an existing allow-list to current normalized research versions.
+
+        The input is already the caller's immutable scope.  PDFs, legacy rows and
+        tied daily/full projections are retained; only older normalized research
+        snapshots for the same ticker are removed.
+        """
+
+        ordered_ids = list(dict.fromkeys(str(item) for item in allowed_ids))
+        if not ordered_ids:
+            return []
+        rows: dict[str, dict[str, Any]] = {}
+        # Stay below SQLite's conservative bind-variable limit for large corpora.
+        for start in range(0, len(ordered_ids), 400):
+            batch = ordered_ids[start : start + 400]
+            placeholders = ",".join("?" for _ in batch)
+            with self.connect() as db:
+                selected = db.execute(
+                    f"""
+                    SELECT id, source_type, content_kind, ticker,
+                           analysis_date, analysis_cutoff
+                    FROM documents
+                    WHERE status='ready' AND id IN ({placeholders})
+                    """,
+                    tuple(batch),
+                ).fetchall()
+            rows.update((str(row["id"]), dict(row)) for row in selected)
+
+        newest_by_ticker: dict[str, tuple[str, str]] = {}
+        for row in rows.values():
+            ticker = str(row.get("ticker") or "").strip().upper()
+            if (
+                row.get("source_type") != "trading_digest"
+                or row.get("content_kind") not in {"daily_digest_v1", "full_report_v1"}
+                or not ticker
+            ):
+                continue
+            version = (
+                str(row.get("analysis_date") or ""),
+                str(row.get("analysis_cutoff") or ""),
+            )
+            newest_by_ticker[ticker] = max(
+                version, newest_by_ticker.get(ticker, version)
+            )
+
+        retained: list[str] = []
+        for document_id in ordered_ids:
+            row = rows.get(document_id)
+            if row is None:
+                continue
+            ticker = str(row.get("ticker") or "").strip().upper()
+            normalized = (
+                row.get("source_type") == "trading_digest"
+                and row.get("content_kind") in {"daily_digest_v1", "full_report_v1"}
+                and bool(ticker)
+            )
+            version = (
+                str(row.get("analysis_date") or ""),
+                str(row.get("analysis_cutoff") or ""),
+            )
+            if not normalized or version == newest_by_ticker[ticker]:
+                retained.append(document_id)
+        return retained
 
     def ensure_session(self, session_id: str) -> None:
         now = utc_now()

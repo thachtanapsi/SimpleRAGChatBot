@@ -134,6 +134,7 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     document_ids: list[str] | None = None
     filters: RetrievalFilters | None = None
+    explain: bool = Field(default=False, strict=True)
 
 
 class DigestClaim(BaseModel):
@@ -360,6 +361,19 @@ def sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {encoded}\n\n"
 
 
+def rag_error_payload(exc: RAGError) -> dict[str, Any]:
+    """Serialize only stable, public error metadata for REST and SSE."""
+
+    payload: dict[str, Any] = {"detail": str(exc)}
+    if isinstance(exc, DuplicateDocumentError):
+        payload["document_id"] = exc.document_id
+    if error_code := getattr(exc, "error_code", None):
+        payload["code"] = error_code
+    if reason_code := getattr(exc, "reason_code", None):
+        payload["reason_code"] = reason_code
+    return payload
+
+
 def full_report_response(
     document: dict[str, Any], payload: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -424,17 +438,32 @@ def create_app(
     )
 
     @app.exception_handler(RAGError)
-    async def rag_error_handler(_request: Request, exc: RAGError) -> JSONResponse:
-        payload: dict[str, Any] = {"detail": str(exc)}
-        if isinstance(exc, DuplicateDocumentError):
-            payload["document_id"] = exc.document_id
-        if error_code := getattr(exc, "error_code", None):
-            payload["code"] = error_code
-        return JSONResponse(status_code=exc.status_code, content=payload)
+    async def rag_error_handler(request: Request, exc: RAGError) -> JSONResponse:
+        managed_runtime.logger.error(
+            "RAG request failed",
+            extra={
+                "event": "rag_error",
+                "request_id": getattr(request.state, "request_id", None),
+                "reason_code": (
+                    getattr(exc, "reason_code", None)
+                    or getattr(exc, "error_code", None)
+                    or type(exc).__name__
+                ),
+            },
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=rag_error_payload(exc),
+        )
 
     @app.middleware("http")
     async def request_metadata(request: Request, call_next: Any) -> Response:
-        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        supplied_request_id = request.headers.get("x-request-id", "")
+        request_id = (
+            supplied_request_id
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", supplied_request_id)
+            else str(uuid.uuid4())
+        )
         request.state.request_id = request_id
         started = time.perf_counter()
         try:
@@ -445,8 +474,8 @@ def create_app(
                 extra={
                     "event": "request_failed",
                     "request_id": request_id,
-                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
-                    "error": type(exc).__name__,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "reason_code": type(exc).__name__,
                 },
             )
             raise
@@ -456,7 +485,7 @@ def create_app(
             extra={
                 "event": "request_complete",
                 "request_id": request_id,
-                "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
             },
         )
         return response
@@ -604,11 +633,26 @@ def create_app(
     @app.post("/api/chat")
     async def chat(payload: ChatRequest) -> dict[str, Any]:
         if payload.filters:
+            if payload.explain:
+                return await managed_runtime.chat.answer(
+                    payload.question,
+                    payload.session_id,
+                    payload.document_ids,
+                    payload.filters.storage_dict(),
+                    explain=True,
+                )
             return await managed_runtime.chat.answer(
                 payload.question,
                 payload.session_id,
                 payload.document_ids,
                 payload.filters.storage_dict(),
+            )
+        if payload.explain:
+            return await managed_runtime.chat.answer(
+                payload.question,
+                payload.session_id,
+                payload.document_ids,
+                explain=True,
             )
         return await managed_runtime.chat.answer(
             payload.question, payload.session_id, payload.document_ids
@@ -617,18 +661,33 @@ def create_app(
     @app.post("/api/chat/stream")
     async def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
         async def event_source() -> AsyncIterator[str]:
-            generator = (
-                managed_runtime.chat.stream(
+            if payload.filters:
+                if payload.explain:
+                    generator = managed_runtime.chat.stream(
+                        payload.question,
+                        payload.session_id,
+                        payload.document_ids,
+                        payload.filters.storage_dict(),
+                        explain=True,
+                    )
+                else:
+                    generator = managed_runtime.chat.stream(
+                        payload.question,
+                        payload.session_id,
+                        payload.document_ids,
+                        payload.filters.storage_dict(),
+                    )
+            elif payload.explain:
+                generator = managed_runtime.chat.stream(
                     payload.question,
                     payload.session_id,
                     payload.document_ids,
-                    payload.filters.storage_dict(),
+                    explain=True,
                 )
-                if payload.filters
-                else managed_runtime.chat.stream(
+            else:
+                generator = managed_runtime.chat.stream(
                     payload.question, payload.session_id, payload.document_ids
                 )
-            )
             try:
                 async for item in generator:
                     if await request.is_disconnected():
@@ -636,17 +695,26 @@ def create_app(
                         return
                     yield sse(item["event"], item["data"])
             except RAGError as exc:
-                error_data = {"detail": str(exc)}
-                if error_code := getattr(exc, "error_code", None):
-                    error_data["code"] = error_code
-                yield sse("error", error_data)
+                managed_runtime.logger.error(
+                    "RAG stream failed",
+                    extra={
+                        "event": "rag_stream_error",
+                        "request_id": request.state.request_id,
+                        "reason_code": (
+                            getattr(exc, "reason_code", None)
+                            or getattr(exc, "error_code", None)
+                            or type(exc).__name__
+                        ),
+                    },
+                )
+                yield sse("error", rag_error_payload(exc))
             except Exception as exc:
                 managed_runtime.logger.error(
                     "stream failed",
                     extra={
                         "event": "stream_failed",
                         "request_id": request.state.request_id,
-                        "error": type(exc).__name__,
+                        "reason_code": type(exc).__name__,
                     },
                 )
                 yield sse("error", {"detail": "Lỗi streaming nội bộ"})

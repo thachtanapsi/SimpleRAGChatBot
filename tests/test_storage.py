@@ -73,7 +73,7 @@ def test_schema_v2_parent_child_rows_migrate_to_page_ranges(settings):
         ).fetchone()[0]
     assert parent == (3, 3, "page")
     assert child == (3, 3, "page")
-    assert version == "7"
+    assert version == "8"
 
 
 def test_digest_provenance_columns_migrate_without_replacing_legacy_rows(settings):
@@ -150,6 +150,34 @@ def test_interrupted_job_returns_to_pending(settings, tmp_path):
     assert storage.claim_next_pending()["status"] == "indexing"
     assert storage.reset_interrupted_jobs() == 1
     assert storage.get_document("doc_hash")["status"] == "pending"
+
+
+def test_list_ready_tickers_returns_distinct_canonical_stable_values(
+    settings, tmp_path
+):
+    storage = SQLiteStorage(settings.sqlite_path)
+    storage.initialise()
+    documents = (
+        ("ready-hpg-lower", "ready-hpg-lower-sha", "hpg", "ready"),
+        ("ready-hpg-spaced", "ready-hpg-spaced-sha", " HPG ", "ready"),
+        ("ready-vnm", "ready-vnm-sha", "vNm", "ready"),
+        ("ready-blank", "ready-blank-sha", "   ", "ready"),
+        ("ready-null", "ready-null-sha", None, "ready"),
+        ("failed-vcb", "failed-vcb-sha", "VCB", "failed"),
+    )
+    for document_id, sha256, ticker, status in documents:
+        add_document(storage, tmp_path, doc_id=document_id, sha=sha256)
+        with storage.connect() as db:
+            db.execute(
+                "UPDATE documents SET ticker=?, status=? WHERE id=?",
+                (ticker, status, document_id),
+            )
+
+    assert storage.list_ready_tickers() == ["HPG", "VNM"]
+
+    restarted = SQLiteStorage(settings.sqlite_path)
+    restarted.initialise()
+    assert restarted.list_ready_tickers() == ["HPG", "VNM"]
 
 
 def test_pending_document_locked_for_delete_cannot_be_claimed(settings, tmp_path):

@@ -8,6 +8,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 from .config import Settings
 from .full_reports import canonicalise_full_report
@@ -27,6 +28,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate = commands.add_parser("evaluate", help="Chạy bộ eval local JSONL")
     evaluate.add_argument("path", nargs="?", default="evals/questions.jsonl")
+    evaluate.add_argument(
+        "--release-gate",
+        action="store_true",
+        help="Dùng schema advanced v1 và quality gates production (tối thiểu 150 câu)",
+    )
+    evaluate.add_argument(
+        "--results",
+        help="JSONL trace đã gắn nhãn từ lần chạy advanced local",
+    )
+    evaluate.add_argument(
+        "--legacy-results",
+        help="JSON result của lần chạy regression bộ 30 câu hiện tại",
+    )
+    evaluate.add_argument(
+        "--legacy-baseline",
+        help="JSON baseline đã commit của đúng bộ 30 câu để kiểm tra no-regression",
+    )
+    evaluate.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Chỉ kiểm tra advanced golden JSONL, không chấm release gate",
+    )
     serve = commands.add_parser("serve", help="Chạy web/API trên localhost")
     serve.add_argument(
         "--host",
@@ -42,6 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
     mode = backfill.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--apply", action="store_true")
+    graph_reindex = commands.add_parser(
+        "graph-reindex",
+        help="Lập kế hoạch hoặc dựng lại evidence graph, không reindex Chroma/PDF",
+    )
+    graph_mode = graph_reindex.add_mutually_exclusive_group(required=True)
+    graph_mode.add_argument("--dry-run", action="store_true")
+    graph_mode.add_argument("--apply", action="store_true")
+    graph_reindex.add_argument("--document-id")
     return parser
 
 
@@ -232,6 +263,120 @@ def backfill_full_reports_command(*, apply: bool) -> int:
     return 1 if counts["failed"] else 0
 
 
+async def _local_ollama_model_digest(settings: Settings, model_name: str) -> str | None:
+    """Read a local model digest; never contacts a cloud endpoint."""
+
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(f"{settings.ollama_base_url}/api/tags")
+            response.raise_for_status()
+        for item in response.json().get("models", []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("model") or "")
+            if name in {model_name, f"{model_name}:latest"} and item.get("digest"):
+                return str(item["digest"])
+    except Exception:
+        return None
+    return None
+
+
+async def graph_reindex_command(
+    *, apply: bool, document_id: str | None = None
+) -> int:
+    """Rebuild only derived SQLite graph state for normalized research."""
+
+    from langchain_ollama import ChatOllama
+
+    from .graph import GraphService
+    from .graph_extraction import LocalGraphExtractor, graph_extractor_fingerprint
+
+    settings = Settings.from_env()
+    storage = SQLiteStorage(settings.sqlite_path)
+    storage.initialise()
+    clauses = [
+        "status='ready'",
+        "source_type='trading_digest'",
+        "content_kind IN ('daily_digest_v1', 'full_report_v1')",
+        "index_fingerprint IS NOT NULL",
+    ]
+    params: list[str] = []
+    if document_id:
+        clauses.append("id=?")
+        params.append(document_id)
+    with storage.connect() as db:
+        rows = db.execute(
+            f"SELECT DISTINCT index_fingerprint FROM documents "
+            f"WHERE {' AND '.join(clauses)} ORDER BY index_fingerprint",
+            tuple(params),
+        ).fetchall()
+    fingerprints = [str(row["index_fingerprint"]) for row in rows]
+    model_digest = await _local_ollama_model_digest(
+        settings, settings.graph_extractor_model
+    )
+    summary: dict[str, Any] = {
+        "mode": "apply" if apply else "dry-run",
+        "document_id": document_id,
+        "eligible": 0,
+        "scheduled": 0,
+        "built": 0,
+        "failed": 0,
+        "fingerprints": len(fingerprints),
+    }
+    for index_fingerprint in fingerprints:
+        extractor_fingerprint = graph_extractor_fingerprint(
+            index_fingerprint=index_fingerprint,
+            model_name=settings.graph_extractor_model,
+            model_digest=model_digest,
+        )
+        generation_lock = asyncio.Semaphore(1)
+        extractor = None
+        if apply:
+            graph_llm = ChatOllama(
+                model=settings.graph_extractor_model,
+                base_url=settings.ollama_base_url,
+                reasoning=False,
+                temperature=0,
+                num_ctx=8192,
+                num_predict=min(settings.answer_num_predict, 1536),
+            )
+            extractor = LocalGraphExtractor(graph_llm)
+        service = GraphService(
+            storage,
+            index_fingerprint=index_fingerprint,
+            extractor_fingerprint=extractor_fingerprint,
+            extractor=extractor,
+            generation_lock=generation_lock,
+            worker_concurrency=1,
+        )
+        plan = await asyncio.to_thread(
+            service.reindex,
+            document_id,
+            apply=apply,
+        )
+        summary["eligible"] += int(plan["eligible"])
+        summary["scheduled"] += len(plan["items"])
+        if not apply:
+            continue
+        for item in plan["items"]:
+            try:
+                await service.build_document_async(str(item["document_id"]))
+                summary["built"] += 1
+            except Exception:
+                summary["failed"] += 1
+    print(
+        json.dumps(
+            summary,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 1 if summary["failed"] else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     command = args.command or "chat"
@@ -245,11 +390,58 @@ def main(argv: list[str] | None = None) -> int:
     if command == "reindex":
         return asyncio.run(reindex_command())
     if command == "evaluate":
-        from .evaluation import evaluate_file
+        from .evaluation import (
+            AdvancedEvalValidationError,
+            evaluate_advanced_release_gate,
+            evaluate_file,
+        )
 
+        if args.release_gate:
+            try:
+                return evaluate_advanced_release_gate(
+                    Path(args.path),
+                    results_path=Path(args.results) if args.results else None,
+                    legacy_result_path=(
+                        Path(args.legacy_results) if args.legacy_results else None
+                    ),
+                    legacy_baseline_path=(
+                        Path(args.legacy_baseline) if args.legacy_baseline else None
+                    ),
+                    validate_only=bool(args.validate_only),
+                )
+            except AdvancedEvalValidationError as exc:
+                print(
+                    json.dumps(
+                        {
+                            "mode": "advanced_release_gate",
+                            "valid": False,
+                            "error": str(exc),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    file=sys.stderr,
+                )
+                return 2
+        if (
+            args.results
+            or args.legacy_results
+            or args.legacy_baseline
+            or args.validate_only
+        ):
+            raise ValueError(
+                "--results/--legacy-results/--legacy-baseline/--validate-only "
+                "chỉ dùng với --release-gate"
+            )
         return asyncio.run(evaluate_file(Path(args.path)))
     if command == "backfill-full-reports":
         return backfill_full_reports_command(apply=bool(args.apply))
+    if command == "graph-reindex":
+        return asyncio.run(
+            graph_reindex_command(
+                apply=bool(args.apply),
+                document_id=args.document_id,
+            )
+        )
     return asyncio.run(chat_command())
 
 

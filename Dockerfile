@@ -17,12 +17,14 @@ RUN --mount=type=cache,id=simple-rag-pip,target=/root/.cache/pip,sharing=locked 
     --index-url "${PYTORCH_CPU_INDEX_URL}" \
     "torch==${TORCH_VERSION}"
 COPY pyproject.toml README.md ./
-COPY rag_app ./rag_app
+RUN mkdir /src/rag_app
+RUN touch /src/rag_app/__init__.py
 RUN --mount=type=cache,id=simple-rag-deps-py312-v2,target=/root/.cache/pip,sharing=locked \
     /opt/rag-venv/bin/pip install \
     --timeout "${PIP_TIMEOUT_SECONDS}" \
     --retries "${PIP_RETRY_COUNT}" \
     .
+RUN rm -rf /src/rag_app
 
 FROM python:3.12-slim-bookworm AS app
 
@@ -46,9 +48,10 @@ RUN apt-get update \
     && useradd --create-home --uid 10001 rag \
     && install -d -m 0755 -o rag -g rag /app/papers /data /models/huggingface
 COPY --from=build /opt/rag-venv /opt/rag-venv
+COPY --chown=rag:rag rag_app /app/rag_app
 
 USER rag
 WORKDIR /app
 EXPOSE 8000
 
-CMD ["local-rag", "serve", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "rag_app.cli", "serve", "--host", "0.0.0.0", "--port", "8000"]

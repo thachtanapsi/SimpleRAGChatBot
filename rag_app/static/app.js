@@ -281,7 +281,11 @@ elements.chatForm.addEventListener("submit", async (event) => {
         if (typeof data.answer === "string") answer = data.answer;
         renderAssistantAnswer(assistant.bubble, answer);
       },
-      error(data) { throw new Error(data.detail || "Lỗi streaming"); },
+      error(data) {
+        const diagnostic = [data.code, data.reason_code].filter(Boolean).join(" / ");
+        const suffix = diagnostic ? `\nMã chẩn đoán: ${diagnostic}` : "";
+        throw new Error(`${data.detail || "Lỗi streaming"}${suffix}`);
+      },
     });
   } catch (error) {
     assistant.bubble.textContent = `Lỗi: ${error.message}`;

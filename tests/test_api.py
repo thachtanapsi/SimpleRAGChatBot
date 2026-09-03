@@ -3,12 +3,16 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from rag_app.api import create_app
-from rag_app.errors import GenerationTruncatedError
+from rag_app.errors import GenerationTruncatedError, SelfCheckUnavailableError
 
 
 class FakeLogger:
+    def __init__(self):
+        self.error_events = []
+
     def info(self, *_args, **_kwargs): pass
-    def error(self, *_args, **_kwargs): pass
+    def error(self, *_args, **kwargs):
+        self.error_events.append(kwargs.get("extra", {}))
 
 
 class FakeStorage:
@@ -74,6 +78,19 @@ class TruncatedFakeChat(FakeChat):
         raise GenerationTruncatedError(2048)
 
 
+class DiagnosticSelfCheckFakeChat(FakeChat):
+    @staticmethod
+    def failure():
+        return SelfCheckUnavailableError("self_check_response_contract_invalid")
+
+    async def answer(self, question, session_id, document_ids):
+        raise self.failure()
+
+    async def stream(self, question, session_id, document_ids):
+        yield {"event": "meta", "data": {"session_id": session_id or "new-session"}}
+        raise self.failure()
+
+
 class FakeRuntime:
     def __init__(self):
         self.storage = FakeStorage()
@@ -94,7 +111,15 @@ def test_api_upload_status_delete_chat_sse_and_health(settings):
     runtime = FakeRuntime()
     app = create_app(settings, runtime)
     with TestClient(app) as client:
-        assert client.get("/api/health").json()["status"] == "ok"
+        health = client.get(
+            "/api/health", headers={"x-request-id": "request-1"}
+        )
+        assert health.json()["status"] == "ok"
+        assert health.headers["x-request-id"] == "request-1"
+        sanitised = client.get(
+            "/api/health", headers={"x-request-id": "private question text"}
+        )
+        assert sanitised.headers["x-request-id"] != "private question text"
         assert client.get("/api/documents").json()[0]["id"] == "doc1"
         assert client.get("/api/documents/doc1").status_code == 200
 
@@ -136,6 +161,8 @@ def test_static_ui_has_no_cdn(settings):
         script = client.get("/static/app.js")
         assert "source.page_end" in script.text
         assert "renderAssistantAnswer" in script.text
+        assert "Mã chẩn đoán" in script.text
+        assert "data.reason_code" in script.text
 
 
 def test_truncated_generation_has_machine_readable_error(settings):
@@ -153,3 +180,49 @@ def test_truncated_generation_has_machine_readable_error(settings):
         assert "event: error" in stream.text
         assert '"code":"response_truncated"' in stream.text
         assert "event: done" not in stream.text
+
+
+def test_self_check_failure_is_displayed_and_logged_with_safe_reason(settings):
+    runtime = FakeRuntime()
+    runtime.chat = DiagnosticSelfCheckFakeChat()
+    app = create_app(settings, runtime)
+
+    with TestClient(app) as client:
+        answer = client.post(
+            "/api/chat",
+            headers={"x-request-id": "rest-self-check-1"},
+            json={"question": "Question"},
+        )
+        assert answer.status_code == 503
+        assert answer.json()["code"] == "self_check_unavailable"
+        assert (
+            answer.json()["reason_code"]
+            == "self_check_response_contract_invalid"
+        )
+        assert "không đúng cấu trúc" in answer.json()["detail"]
+
+        stream = client.post(
+            "/api/chat/stream",
+            headers={"x-request-id": "sse-self-check-1"},
+            json={"question": "Question"},
+        )
+        assert "event: error" in stream.text
+        assert '"code":"self_check_unavailable"' in stream.text
+        assert '"reason_code":"self_check_response_contract_invalid"' in stream.text
+        assert "event: done" not in stream.text
+
+    assert {
+        (item["event"], item["request_id"], item["reason_code"])
+        for item in runtime.logger.error_events
+    } >= {
+        (
+            "rag_error",
+            "rest-self-check-1",
+            "self_check_response_contract_invalid",
+        ),
+        (
+            "rag_stream_error",
+            "sse-self-check-1",
+            "self_check_response_contract_invalid",
+        ),
+    }

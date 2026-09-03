@@ -5,6 +5,7 @@
   "embedding_revision": "5617a9f61b028005a4858fdac845db406aefb181",
   "corpus": "two bundled PDF documents, fresh temporary index",
   "cases": 30,
+  "question_set_sha256": "804a72035ca1f8dd90e387d563120c4616f8369a283db71bac0be531d475e97a",
   "metrics": {
     "parent_recall_at_5": 1.0,
     "citation_correct_page": 0.8947,

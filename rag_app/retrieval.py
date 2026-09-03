@@ -13,8 +13,37 @@ from .full_reports import (
     FULL_SECTION_CITATION_LABELS,
     FULL_SECTION_LABELS,
 )
+from .reranking import RerankCandidate, RerankResult, RerankerUnavailableError
 from .storage import SQLiteStorage
 from .vector_index import ChromaIndex
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalDiagnostics:
+    """Điểm theo từng channel; chỉ xuất ra API khi caller yêu cầu explain."""
+
+    child_id: str
+    dense_rank: int | None
+    lexical_rank: int | None
+    dense_score: float | None
+    lexical_score: float | None
+    fusion_score: float
+    rerank_score: float | None
+    graph_score: float | None = None
+
+    def public(self) -> dict[str, Any]:
+        payload = asdict(self)
+        for key in (
+            "dense_score",
+            "lexical_score",
+            "fusion_score",
+            "rerank_score",
+            "graph_score",
+        ):
+            value = payload[key]
+            if value is not None:
+                payload[key] = round(float(value), 6)
+        return payload
 
 
 @dataclass(slots=True)
@@ -44,12 +73,13 @@ class RetrievedSource:
     pipeline_version: str | None = None
     execution_generation: int | None = None
     contains_decision_content: bool = False
+    diagnostics: RetrievalDiagnostics | None = None
 
     @property
     def resolved_page_end(self) -> int:
         return self.page if self.page_end is None else self.page_end
 
-    def public(self, cited: bool = False) -> dict[str, Any]:
+    def public(self, cited: bool = False, *, explain: bool = False) -> dict[str, Any]:
         payload = {
             "id": self.id,
             "document_id": self.document_id,
@@ -88,6 +118,8 @@ class RetrievedSource:
                     "label": self.digest_label,
                 }
             )
+        if explain and self.diagnostics is not None:
+            payload["explain"] = {"retrieval": self.diagnostics.public()}
         return payload
 
     @property
@@ -152,11 +184,13 @@ class ParentChildRetriever:
         storage: SQLiteStorage,
         index: ChromaIndex,
         logger: Any | None = None,
+        reranker: Any | None = None,
     ):
         self.settings = settings
         self.storage = storage
         self.index = index
         self.logger = logger
+        self.reranker = reranker
 
     def retrieve(
         self,
@@ -165,40 +199,52 @@ class ParentChildRetriever:
         *,
         filters: dict[str, Any] | None = None,
         restrict_document_ids: bool = True,
+        semantic_query: str | None = None,
+        lexical_query: str | None = None,
+        exact_terms: Sequence[str] | None = None,
     ) -> list[RetrievedSource]:
+        dense_query = (semantic_query or query).strip()
+        keyword_query = self._lexical_query(lexical_query or query, exact_terms)
         if filters or not restrict_document_ids:
             dense_results = self.index.search(
-                query,
-                k=self.settings.dense_search_k,
+                dense_query,
+                k=int(getattr(self.settings, "dense_search_k", 30)),
                 document_ids=document_ids if restrict_document_ids else None,
                 filters=filters,
             )
         else:
             dense_results = self.index.search(
-                query, k=self.settings.dense_search_k, document_ids=document_ids
+                dense_query,
+                k=int(getattr(self.settings, "dense_search_k", 30)),
+                document_ids=document_ids,
             )
         lexical_results = (
             (
                 self.storage.lexical_search(
-                    query,
-                    k=self.settings.lexical_search_k,
+                    keyword_query,
+                    k=int(getattr(self.settings, "lexical_search_k", 30)),
                     document_ids=document_ids if restrict_document_ids else None,
                     filters=filters,
                 )
                 if filters or not restrict_document_ids
                 else self.storage.lexical_search(
-                    query,
-                    k=self.settings.lexical_search_k,
+                    keyword_query,
+                    k=int(getattr(self.settings, "lexical_search_k", 30)),
                     document_ids=document_ids,
                 )
             )
-            if self.settings.hybrid_search
+            if bool(getattr(self.settings, "hybrid_search", False))
             else []
         )
 
-        child_parents: dict[str, str] = {}
-        child_fusion_scores: dict[str, float] = {}
+        candidates: dict[str, _ChildCandidate] = {}
         parent_dense_scores: dict[str, float] = {}
+        dense_weight = float(getattr(self.settings, "dense_weight", 0.7))
+        lexical_weight = float(getattr(self.settings, "lexical_weight", 0.3))
+        rrf_k = int(getattr(self.settings, "rrf_k", 60))
+        relevance_threshold = float(
+            getattr(self.settings, "relevance_threshold", 0.35)
+        )
 
         for rank, (child, score) in enumerate(dense_results, start=1):
             parent_id = str(child.metadata.get("parent_id", ""))
@@ -208,10 +254,20 @@ class ParentChildRetriever:
                 child.metadata.get("child_id") or f"dense_{rank}_{parent_id}"
             )
             numeric_score = max(0.0, min(1.0, float(score)))
-            child_parents[child_id] = parent_id
-            child_fusion_scores[child_id] = child_fusion_scores.get(child_id, 0.0) + (
-                self.settings.dense_weight / (self.settings.rrf_k + rank)
+            candidate = candidates.setdefault(
+                child_id,
+                _ChildCandidate(
+                    id=child_id,
+                    parent_id=parent_id,
+                    text=str(child.page_content or ""),
+                ),
             )
+            if candidate.parent_id != parent_id:
+                continue
+            candidate.text = candidate.text or str(child.page_content or "")
+            candidate.dense_rank = rank
+            candidate.dense_score = numeric_score
+            candidate.fusion_score += dense_weight / (rrf_k + rank)
             parent_dense_scores[parent_id] = max(
                 numeric_score, parent_dense_scores.get(parent_id, 0.0)
             )
@@ -221,35 +277,93 @@ class ParentChildRetriever:
             parent_id = str(child.get("parent_id", ""))
             if not child_id or not parent_id:
                 continue
-            child_parents[child_id] = parent_id
-            child_fusion_scores[child_id] = child_fusion_scores.get(child_id, 0.0) + (
-                self.settings.lexical_weight / (self.settings.rrf_k + rank)
+            candidate = candidates.setdefault(
+                child_id,
+                _ChildCandidate(
+                    id=child_id,
+                    parent_id=parent_id,
+                    text=str(child.get("text") or ""),
+                ),
             )
-
-        parent_fusion_scores: dict[str, float] = {}
-        best_child_ids: dict[str, str] = {}
-        for child_id, fusion_score in child_fusion_scores.items():
-            parent_id = child_parents[child_id]
-            # Lexical retrieval chỉ rerank parent đã vượt qua dense evidence gate.
-            if parent_dense_scores.get(parent_id, 0.0) < self.settings.relevance_threshold:
+            if candidate.parent_id != parent_id:
                 continue
-            if fusion_score > parent_fusion_scores.get(parent_id, 0.0):
-                parent_fusion_scores[parent_id] = fusion_score
-                best_child_ids[parent_id] = child_id
+            candidate.text = candidate.text or str(child.get("text") or "")
+            candidate.lexical_rank = rank
+            lexical_score = child.get("lexical_score")
+            candidate.lexical_score = (
+                float(lexical_score) if lexical_score is not None else None
+            )
+            candidate.fusion_score += lexical_weight / (rrf_k + rank)
 
-        all_ranked_ids = sorted(
-            parent_fusion_scores,
-            key=lambda parent_id: (
-                parent_fusion_scores[parent_id],
-                parent_dense_scores.get(parent_id, 0.0),
-            ),
-            reverse=True,
-        )
+        # True union: dense candidate cần qua relevance gate; mọi lexical hit đã
+        # được FTS giới hạn đều có thể cứu một dense miss.
+        eligible = [
+            item
+            for item in candidates.values()
+            if item.lexical_rank is not None
+            or (item.dense_score or 0.0) >= relevance_threshold
+        ]
+        eligible.sort(key=_candidate_rrf_sort_key)
+
+        rerank_enabled = bool(getattr(self.settings, "rerank_enabled", False))
+        if rerank_enabled:
+            if self.reranker is None:
+                raise RerankerUnavailableError(
+                    "Reranker được bật nhưng chưa được khởi tạo"
+                )
+            candidate_k = int(getattr(self.settings, "rerank_candidate_k", 40))
+            child_k = int(getattr(self.settings, "rerank_child_k", 12))
+            min_score = float(getattr(self.settings, "rerank_min_score", 0.5))
+            eligible = eligible[:candidate_k]
+
+            # Storage cũ không trả child text cho BM25. Ưu tiên c.text khi có và
+            # chỉ fallback parent text để vẫn tương thích index đã tồn tại.
+            candidate_parents = self.storage.parents_by_ids(
+                list(dict.fromkeys(item.parent_id for item in eligible))
+            )
+            rerank_inputs: list[RerankCandidate] = []
+            valid_candidates: dict[str, _ChildCandidate] = {}
+            for item in eligible:
+                parent = candidate_parents.get(item.parent_id)
+                if not parent:
+                    continue
+                text = item.text or str(parent.get("text") or "")
+                if not text:
+                    continue
+                item.text = text
+                valid_candidates[item.id] = item
+                rerank_inputs.append(RerankCandidate(id=item.id, text=text))
+            reranked = self.reranker.rerank(
+                dense_query,
+                rerank_inputs,
+                top_k=child_k,
+                min_score=min_score,
+            )
+            eligible = []
+            for result in reranked:
+                result_id, result_score = _rerank_result_values(result)
+                candidate = valid_candidates.get(result_id)
+                if candidate is None:
+                    continue
+                candidate.rerank_score = result_score
+                eligible.append(candidate)
+
+        # Child được xếp hạng trước, rồi mới group parent.
+        best_candidates: dict[str, _ChildCandidate] = {}
+        all_ranked_ids: list[str] = []
+        for candidate in eligible:
+            if candidate.parent_id in best_candidates:
+                continue
+            best_candidates[candidate.parent_id] = candidate
+            all_ranked_ids.append(candidate.parent_id)
         parents = self.storage.parents_by_ids(all_ranked_ids)
 
         # Bridge thay thế các parent một trang nằm đúng hai trang biên để prompt
         # không nhận cùng một bằng chứng hai lần. Tiếp tục quét để luôn đủ top-k.
         selected: list[dict[str, Any]] = []
+        parent_search_k = int(getattr(self.settings, "parent_search_k", 5))
+        if rerank_enabled:
+            parent_search_k = min(parent_search_k, 5)
         for parent_id in all_ranked_ids:
             parent = parents.get(parent_id)
             if not parent:
@@ -277,7 +391,7 @@ class ParentChildRetriever:
                     )
                 ]
             selected.append(parent)
-            if len(selected) >= self.settings.parent_search_k:
+            if len(selected) >= parent_search_k:
                 break
 
         ranked_ids = [str(parent["id"]) for parent in selected]
@@ -286,6 +400,8 @@ class ParentChildRetriever:
             parent = parents.get(parent_id)
             if not parent:
                 continue
+            best = best_candidates[parent_id]
+            dense_score = parent_dense_scores.get(parent_id, 0.0)
             sources.append(
                 RetrievedSource(
                     id=str(number),
@@ -296,7 +412,8 @@ class ParentChildRetriever:
                     parent_id=parent_id,
                     text=parent["text"],
                     # API cũ tiếp tục nhận dense cosine relevance trong [0, 1].
-                    score=parent_dense_scores[parent_id],
+                    # Lexical-only evidence không giả tạo dense score.
+                    score=dense_score,
                     kind=str(parent.get("kind") or "page"),
                     source_type=str(parent.get("source_type") or "pdf"),
                     ticker=parent.get("ticker"),
@@ -322,6 +439,15 @@ class ParentChildRetriever:
                     contains_decision_content=bool(
                         parent.get("contains_decision_content")
                     ),
+                    diagnostics=RetrievalDiagnostics(
+                        child_id=best.id,
+                        dense_rank=best.dense_rank,
+                        lexical_rank=best.lexical_rank,
+                        dense_score=best.dense_score,
+                        lexical_score=best.lexical_score,
+                        fusion_score=best.fusion_score,
+                        rerank_score=best.rerank_score,
+                    ),
                 )
             )
             if self.logger:
@@ -330,12 +456,66 @@ class ParentChildRetriever:
                     extra={
                         "event": "parent_retrieved",
                         "document_id": parent["document_id"],
-                        "chunk_ids": [best_child_ids.get(parent_id, ""), parent_id],
-                        "score": round(parent_dense_scores[parent_id], 4),
-                        "fusion_score": round(parent_fusion_scores[parent_id], 6),
+                        "chunk_ids": [best.id, parent_id],
+                        "score": round(dense_score, 4),
+                        "fusion_score": round(best.fusion_score, 6),
+                        "rerank_score": (
+                            round(best.rerank_score, 6)
+                            if best.rerank_score is not None
+                            else None
+                        ),
                     },
                 )
         return sources
+
+    @staticmethod
+    def _lexical_query(
+        query: str, exact_terms: Sequence[str] | None
+    ) -> str:
+        parts = [query.strip()]
+        seen = {parts[0].casefold()} if parts[0] else set()
+        for raw_term in exact_terms or ():
+            term = str(raw_term).strip()
+            if term and term.casefold() not in seen:
+                parts.append(term)
+                seen.add(term.casefold())
+        return " ".join(item for item in parts if item)
+
+
+@dataclass(slots=True)
+class _ChildCandidate:
+    id: str
+    parent_id: str
+    text: str
+    dense_rank: int | None = None
+    lexical_rank: int | None = None
+    dense_score: float | None = None
+    lexical_score: float | None = None
+    fusion_score: float = 0.0
+    rerank_score: float | None = None
+
+
+def _candidate_rrf_sort_key(candidate: _ChildCandidate) -> tuple[Any, ...]:
+    return (
+        -candidate.fusion_score,
+        -(candidate.dense_score or 0.0),
+        candidate.dense_rank if candidate.dense_rank is not None else 10**9,
+        candidate.lexical_rank if candidate.lexical_rank is not None else 10**9,
+        candidate.id,
+    )
+
+
+def _rerank_result_values(result: Any) -> tuple[str, float]:
+    """Cho phép service thật và test double nhỏ dùng cùng interface."""
+
+    if isinstance(result, RerankResult):
+        return result.id, max(0.0, min(1.0, float(result.score)))
+    if isinstance(result, dict):
+        return str(result["id"]), max(
+            0.0, min(1.0, float(result["score"]))
+        )
+    result_id, score = result
+    return str(result_id), max(0.0, min(1.0, float(score)))
 
 
 def format_context(sources: Sequence[RetrievedSource]) -> str:

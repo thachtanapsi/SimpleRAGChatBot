@@ -710,7 +710,6 @@ def test_digest_payload_limits_and_duplicate_rank_are_rejected(settings):
         )
         assert response.status_code == 400
         assert runtime.storage.list_documents() == []
-
         too_many_claims = digest_payload()
         too_many_claims["sections"]["summary"] = {
             "claims": [
@@ -736,6 +735,47 @@ def test_digest_payload_limits_and_duplicate_rank_are_rejected(settings):
         )
         assert response.status_code == 400
         assert runtime.storage.list_documents() == []
+
+
+def test_typed_digest_claims_are_preserved_for_graph_extraction(settings):
+    configured = replace(settings, rag_service_api_key="test-secret")
+    runtime = DigestRuntime(configured)
+    app = create_app(configured, runtime)
+    payload = digest_payload()
+    payload["sections"]["summary"] = {
+        "text": "Tổng quan HPG.",
+        "claims": [
+            {
+                "text": "HPG có biên lợi nhuận cải thiện.",
+                "confidence": 0.8,
+                "evidence_ids": ["fundamental:1"],
+            }
+        ],
+    }
+
+    with TestClient(app) as client:
+        assert create_batch(client).status_code == 200
+        response = client.post(
+            "/internal/v1/digest-batches/eod-20260821/documents:batch",
+            headers=authorised(),
+            json={"documents": [payload]},
+        )
+        assert response.status_code == 202
+
+    document_id = runtime.storage.list_documents()[0]["id"]
+    claims = runtime.storage.digest_claims(document_id)
+    assert claims == [
+        {
+            "id": claims[0]["id"],
+            "document_id": document_id,
+            "section": "summary",
+            "position": 0,
+            "text": "HPG có biên lợi nhuận cải thiện.",
+            "created_at": claims[0]["created_at"],
+            "confidence": 0.8,
+            "evidence_ids": ["fundamental:1"],
+        }
+    ]
 
 
 def test_digest_batch_item_status_exposes_safe_failure_for_reconciliation(settings):

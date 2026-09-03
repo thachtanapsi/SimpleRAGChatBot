@@ -8,8 +8,14 @@ from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, AIMessageChunk
 
 from rag_app.chat import ChatService, generation_was_truncated, validate_citations
-from rag_app.errors import GenerationTruncatedError, ServiceUnavailableError
+from rag_app.errors import (
+    GenerationTruncatedError,
+    RetrievalToolsUnavailableError,
+    ServiceUnavailableError,
+)
 from rag_app.evaluation import is_abstention, page_range_matches, percentile_95
+from rag_app.orchestration import AgenticResult, OrchestrationExplanation
+from rag_app.reranking import RerankResult, RerankerUnavailableError
 from rag_app.retrieval import ParentChildRetriever, RetrievedSource, format_context
 
 
@@ -162,6 +168,158 @@ def test_weighted_rrf_boosts_exact_keyword_without_changing_public_score(setting
     assert sources[0].score == 0.85
 
 
+class LexicalRescueIndex:
+    def search(self, query, *, k, document_ids):
+        return [
+            (
+                Document(
+                    page_content="semantic child",
+                    metadata={"parent_id": "p1", "child_id": "c1"},
+                ),
+                0.9,
+            )
+        ]
+
+
+class LexicalRescueStorage:
+    def __init__(self):
+        self.query = None
+
+    def lexical_search(self, query, *, k, document_ids):
+        self.query = query
+        return [
+            {
+                "child_id": "c2",
+                "parent_id": "p2",
+                "document_id": "doc1",
+                "lexical_score": -4.2,
+                "text": "exact FFD-2024 child",
+            }
+        ]
+
+    def parents_by_ids(self, ids):
+        return {
+            parent_id: {
+                "id": parent_id,
+                "document_id": "doc1",
+                "filename": "paper.pdf",
+                "page": 1 if parent_id == "p1" else 2,
+                "text": f"content {parent_id}",
+            }
+            for parent_id in ids
+        }
+
+
+def test_true_union_keeps_lexical_only_candidate_with_zero_public_dense_score(settings):
+    storage = LexicalRescueStorage()
+    retriever = ParentChildRetriever(
+        replace(settings, hybrid_search=True), storage, LexicalRescueIndex()
+    )
+
+    sources = retriever.retrieve(
+        "standalone semantic query",
+        ["doc1"],
+        lexical_query="original question",
+        exact_terms=["FFD-2024"],
+    )
+
+    rescued = next(item for item in sources if item.parent_id == "p2")
+    assert rescued.score == 0.0
+    assert rescued.diagnostics.dense_rank is None
+    assert rescued.diagnostics.lexical_rank == 1
+    assert storage.query == "original question FFD-2024"
+    assert "explain" not in rescued.public()
+    assert rescued.public(explain=True)["explain"]["retrieval"] == {
+        "child_id": "c2",
+        "dense_rank": None,
+        "lexical_rank": 1,
+        "dense_score": None,
+        "lexical_score": -4.2,
+        "fusion_score": round(0.3 / 61, 6),
+        "rerank_score": None,
+        "graph_score": None,
+    }
+
+
+class CandidateLimitIndex:
+    def search(self, query, *, k, document_ids):
+        return [
+            (
+                Document(
+                    page_content=f"child {number}",
+                    metadata={"parent_id": f"p{number}", "child_id": f"c{number}"},
+                ),
+                0.95 - number / 100,
+            )
+            for number in range(1, 5)
+        ]
+
+
+class CandidateLimitStorage:
+    def lexical_search(self, query, *, k, document_ids):
+        return []
+
+    def parents_by_ids(self, ids):
+        return {
+            parent_id: {
+                "id": parent_id,
+                "document_id": "doc1",
+                "filename": "paper.pdf",
+                "page": int(parent_id[1:]),
+                "text": f"parent {parent_id}",
+            }
+            for parent_id in ids
+        }
+
+
+class RecordingReranker:
+    def __init__(self):
+        self.ids = []
+
+    def rerank(self, query, candidates, *, top_k, min_score):
+        self.ids = [item.id for item in candidates]
+        assert query == "semantic query"
+        assert top_k == 2
+        assert min_score == 0.5
+        return [RerankResult("c2", 0.99), RerankResult("c1", 0.8)]
+
+
+def test_reranker_limits_children_then_groups_and_keeps_dense_public_score(settings):
+    reranker = RecordingReranker()
+    configured = replace(
+        settings,
+        rerank_enabled=True,
+        rerank_candidate_k=2,
+        rerank_child_k=2,
+        rerank_min_score=0.5,
+    )
+    retriever = ParentChildRetriever(
+        configured,
+        CandidateLimitStorage(),
+        CandidateLimitIndex(),
+        reranker=reranker,
+    )
+
+    sources = retriever.retrieve("semantic query", ["doc1"])
+
+    assert reranker.ids == ["c1", "c2"]
+    assert [item.parent_id for item in sources] == ["p2", "p1"]
+    assert sources[0].score == pytest.approx(0.93)
+    assert sources[0].diagnostics.rerank_score == 0.99
+
+
+def test_enabled_reranker_never_silently_falls_back_when_not_injected(settings):
+    retriever = ParentChildRetriever(
+        replace(settings, rerank_enabled=True),
+        CandidateLimitStorage(),
+        CandidateLimitIndex(),
+    )
+
+    with pytest.raises(RerankerUnavailableError) as caught:
+        retriever.retrieve("semantic query", ["doc1"])
+    assert caught.value.error_code == "rag_reranker_unavailable"
+
+
 class BridgeIndex:
     def search(self, query, *, k, document_ids):
         return [
@@ -266,6 +424,23 @@ class TruncatedLLM:
         )
 
 
+class StructuredAnswerLLM:
+    def __init__(self, result):
+        self.result = result
+        self.structured_call = None
+
+    def with_structured_output(self, schema, *, method, include_raw):
+        self.structured_call = {
+            "schema": schema,
+            "method": method,
+            "include_raw": include_raw,
+        }
+        return self
+
+    async def ainvoke(self, _messages):
+        return self.result
+
+
 @pytest.mark.asyncio
 async def test_query_rewrite_then_validated_answer(settings):
     storage = ChatStorage(history=[{"role": "user", "content": "Earlier"}])
@@ -290,6 +465,31 @@ async def test_below_threshold_abstains_without_calling_llm(settings):
     assert result["citations"] == []
     assert "Không tìm thấy" in result["answer"]
     assert llm.invoke_count == 0
+
+
+@pytest.mark.asyncio
+async def test_explain_is_additive_in_legacy_mode(settings):
+    storage = ChatStorage()
+    service = ChatService(
+        settings,
+        storage,
+        FakeRetriever(),
+        FakeLLM(),
+        asyncio.Semaphore(1),
+    )
+
+    regular = await service.answer("Question", "regular")
+    explained = await service.answer("Question", "explained", explain=True)
+
+    assert "rag" not in regular
+    assert explained["rag"] == {
+        "strategy": "hybrid",
+        "tools": ["hybrid"],
+        "corrective_rounds": 0,
+        "confidence": "medium",
+        "verification_status": "qualified",
+        "abstained": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -357,6 +557,100 @@ async def test_truncated_stream_emits_no_done_and_is_not_saved(settings):
     assert storage.exchanges == []
 
 
+@pytest.mark.asyncio
+async def test_advanced_generator_uses_raw_structured_output(settings):
+    llm = StructuredAnswerLLM(
+        {
+            "raw": AIMessage(
+                content="",
+                response_metadata={"done_reason": "stop", "eval_count": 32},
+            ),
+            "parsed": {
+                "answer": "Evidence is available [1].",
+                "claims": [
+                    {
+                        "text": "Evidence is available.",
+                        "citation_ids": ["1"],
+                    }
+                ],
+            },
+            "parsing_error": None,
+        }
+    )
+    service = ChatService(
+        replace(settings, agentic_enabled=True),
+        ChatStorage(),
+        FakeRetriever(),
+        llm,
+        asyncio.Semaphore(1),
+        orchestrator=CompletedAdvancedOrchestrator(),
+    )
+
+    result = await service._generate_advanced_answer("Question", [source()], None)
+
+    assert result.answer == "Evidence is available [1]."
+    assert llm.structured_call["method"] == "json_schema"
+    assert llm.structured_call["include_raw"] is True
+
+
+@pytest.mark.asyncio
+async def test_advanced_generator_prioritises_truncation_over_parse_error(settings):
+    llm = StructuredAnswerLLM(
+        {
+            "raw": AIMessage(
+                content="{",
+                response_metadata={"done_reason": "length", "eval_count": 2048},
+            ),
+            "parsed": None,
+            "parsing_error": ValueError("incomplete JSON"),
+        }
+    )
+    service = ChatService(
+        replace(settings, agentic_enabled=True),
+        ChatStorage(),
+        FakeRetriever(),
+        llm,
+        asyncio.Semaphore(1),
+        orchestrator=CompletedAdvancedOrchestrator(),
+    )
+
+    with pytest.raises(GenerationTruncatedError):
+        await service._generate_advanced_answer("Question", [source()], None)
+
+
+@pytest.mark.asyncio
+async def test_advanced_generator_uses_its_actual_token_cap_for_truncation(settings):
+    llm = StructuredAnswerLLM(
+        {
+            "raw": AIMessage(content="", response_metadata={"eval_count": 1024}),
+            "parsed": {
+                "answer": "Evidence is available [1].",
+                "claims": [
+                    {
+                        "text": "Evidence is available.",
+                        "citation_ids": ["1"],
+                    }
+                ],
+            },
+            "parsing_error": None,
+        }
+    )
+    service = ChatService(
+        replace(settings, agentic_enabled=True),
+        ChatStorage(),
+        FakeRetriever(),
+        llm,
+        asyncio.Semaphore(1),
+        orchestrator=CompletedAdvancedOrchestrator(),
+        advanced_num_predict=1024,
+    )
+
+    with pytest.raises(GenerationTruncatedError) as error:
+        await service._generate_advanced_answer("Question", [source()], None)
+
+    assert "1024" in str(error.value)
+
+
 class BrokenLLM:
     async def ainvoke(self, _messages):
         raise ConnectionError("ollama stopped")
@@ -373,3 +667,92 @@ async def test_ollama_generation_failure_becomes_service_unavailable(settings):
     )
     with pytest.raises(ServiceUnavailableError):
         await service.answer("Question", "session")
+
+
+class CompletedAdvancedOrchestrator:
+    def __init__(self, answer_text="A" * 300 + " [1]"):
+        self.answer_text = answer_text
+        self.completed = False
+
+    async def run(self, **_kwargs):
+        await asyncio.sleep(0)
+        self.completed = True
+        return AgenticResult(
+            answer=self.answer_text,
+            sources=(source(),),
+            abstained=False,
+            explanation=OrchestrationExplanation(
+                strategy="hybrid",
+                tools=["hybrid"],
+                corrective_rounds=0,
+                confidence="high",
+                verification_status="passed",
+                abstained=False,
+            ),
+            events=(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_advanced_stream_buffers_verified_answer_and_preserves_event_order(settings):
+    storage = ChatStorage()
+    orchestrator = CompletedAdvancedOrchestrator()
+    service = ChatService(
+        replace(settings, agentic_enabled=True),
+        storage,
+        FakeRetriever(),
+        FakeLLM(),
+        asyncio.Semaphore(1),
+        orchestrator=orchestrator,
+    )
+
+    events = [item async for item in service.stream("Question", "session", explain=True)]
+
+    assert orchestrator.completed is True
+    assert [item["event"] for item in events] == [
+        "meta",
+        "token",
+        "token",
+        "sources",
+        "done",
+    ]
+    assert "".join(item["data"]["text"] for item in events[1:3]) == orchestrator.answer_text
+    assert events[-1]["data"]["rag"] == {
+        "strategy": "hybrid",
+        "tools": ["hybrid"],
+        "corrective_rounds": 0,
+        "confidence": "high",
+        "verification_status": "passed",
+        "abstained": False,
+    }
+    assert storage.exchanges == [("session", "Question", orchestrator.answer_text)]
+
+
+@pytest.mark.asyncio
+async def test_advanced_technical_failure_is_not_persisted(settings):
+    class BrokenOrchestrator:
+        async def run(self, **_kwargs):
+            raise RetrievalToolsUnavailableError()
+
+    storage = ChatStorage()
+    service = ChatService(
+        replace(settings, agentic_enabled=True),
+        storage,
+        FakeRetriever(),
+        FakeLLM(),
+        asyncio.Semaphore(1),
+        orchestrator=BrokenOrchestrator(),
+    )
+
+    with pytest.raises(RetrievalToolsUnavailableError):
+        await service.answer("Question", "session")
+    assert storage.exchanges == []
+
+    stream = service.stream("Question", "session")
+    assert (await anext(stream)) == {
+        "event": "meta",
+        "data": {"session_id": "session"},
+    }
+    with pytest.raises(RetrievalToolsUnavailableError):
+        await anext(stream)
+    assert storage.exchanges == []

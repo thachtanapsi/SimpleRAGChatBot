@@ -7,107 +7,62 @@ digest, câu hỏi, embedding và câu trả lời không được gửi tới d
 Stack mặc định:
 
 - `BAAI/bge-m3`: normalized dense embedding local, chỉ đọc từ Hugging Face cache.
+- `BAAI/bge-reranker-v2-m3`: multilingual cross-encoder local, bật theo feature flag.
 - `gemma4:e2b`: sinh câu trả lời bằng Ollama tại `127.0.0.1:11434`.
 - Chroma: vector index bền vững trên ổ đĩa.
-- SQLite + FTS5/BM25: metadata, child text, lexical index, job và lịch sử chat.
+- SQLite + FTS5/BM25: metadata, lexical index, evidence graph và lịch sử chat.
 - FastAPI + HTML/CSS/JavaScript thuần; không dùng CDN hoặc Node.
 
 ## Kiến trúc
 
 ```mermaid
 flowchart TD
-    subgraph INGEST["1. Ingestion chạy nền"]
-        PDF["Upload PDF / thư mục papers"]
-        VALIDATE{"PDF hợp lệ?"}
-        REJECT["Từ chối upload<br/>400 / 409"]
-        JOB["SQLite job<br/>pending → indexing"]
-        PAGE["pypdf đọc text + layout từng trang<br/>giữ filename, document_id, page"]
-        TEXT{"Tổng text ≥ 100 ký tự?"}
-        FAILED["Job failed<br/>PDF scan cần OCR"]
-        BOUNDARY{"Có nội dung tiếp nối<br/>qua trang?"}
-        PARENT["Page parent chunks<br/>2.400 ký tự · overlap 200"]
-        CHILD["Child chunks<br/>600 ký tự · overlap 100"]
-        BRIDGE["Bridge parent + child windows<br/>hai trang liền kề"]
-        EMBED["EmbeddingService · BGE-M3<br/>batch 32 · normalized · CPU/MPS auto"]
-        LEXICAL["FTS5 index<br/>Unicode · không dấu · BM25"]
-        READY["Commit job ready"]
+    PDF["PDF hiện hữu"] --> PC["Parent/child + bridge"]
+    DIGEST["Daily digest / Full Analysis"] --> CANON["Canonical sections + typed claims"]
+    PC --> SQLITE[("SQLite + FTS5")]
+    PC --> CHROMA[("Chroma / BGE-M3")]
+    CANON --> SQLITE
+    CANON --> CHROMA
+    CANON --> GRAPH["Evidence graph worker\nversioned build, exact quotes"]
+    GRAPH --> SQLITE
 
-        PDF --> VALIDATE
-        VALIDATE -->|"MIME · %PDF · SHA-256<br/>≤ 50 MB · ≤ 300 trang"| JOB
-        VALIDATE -->|"Không hợp lệ / trùng"| REJECT
-        JOB -->|"Lưu trạng thái"| SQLITE[("SQLite")]
-        JOB --> PAGE --> TEXT
-        TEXT -->|"Không"| FAILED --> SQLITE
-        TEXT -->|"Có"| BOUNDARY --> PARENT --> CHILD --> EMBED
-        BOUNDARY -->|"Bảng lặp header / câu dang dở"| BRIDGE --> EMBED
-        CHILD --> LEXICAL
-        BRIDGE --> LEXICAL
-        EMBED -->|"Chỉ child vectors"| CHROMA[("Chroma persistent")]
-        EMBED --> READY
-        PARENT -.->|"Parent text + page metadata"| READY
-        BRIDGE -.->|"page_start + page_end"| READY
-        CHILD -.->|"Deterministic child mapping"| READY
-        LEXICAL --> READY
-        READY -->|"Atomic child + FTS commit<br/>+ fingerprint"| SQLITE
-    end
-
-    subgraph CHAT["2. Chat, retrieval và generation"]
-        QUESTION["Câu hỏi<br/>tối đa 4.000 ký tự"]
-        HISTORY["Tối đa 6 lượt gần nhất"]
-        REWRITE{"Có lịch sử?"}
-        STANDALONE["Gemma viết lại thành<br/>truy vấn độc lập"]
-        DENSE["Dense cosine search<br/>30 child chunks"]
-        SPARSE["FTS5/BM25 search<br/>30 child chunks"]
-        FUSION["Weighted RRF<br/>dense 0,7 · lexical 0,3 · k=60"]
-        FILTER["Dense evidence gate<br/>score ≥ 0,35"]
-        GROUP["Nhóm theo parent_id<br/>lấy fused rank tốt nhất"]
-        TOP5["Chọn tối đa 5 parent"]
-        EVIDENCE{"Có bằng chứng?"}
-        ABSTAIN["Trả lời không tìm thấy<br/>không gọi Gemma"]
-        CONTEXT["Nạp parent từ SQLite<br/>gắn nguồn [1], [2], ..."]
-        ESCAPE["Escape XML<br/>chặn prompt injection"]
-        PROMPT["Prompt grounded<br/>cùng ngôn ngữ câu hỏi"]
-        GEMMA["gemma4:e2b qua Ollama<br/>một generation đồng thời"]
-        CHECK["Loại citation ID giả<br/>gắn metadata file + trang"]
-        RESPONSE["JSON hoặc SSE<br/>meta · token · sources · done"]
-        SAVE{"Generation hoàn tất?"}
-
-        QUESTION --> REWRITE
-        SQLITE --> HISTORY --> REWRITE
-        REWRITE -->|"Có"| STANDALONE --> DENSE
-        REWRITE -->|"Không"| DENSE
-        STANDALONE --> SPARSE
-        REWRITE -->|"Không"| SPARSE
-        CHROMA --> DENSE --> FUSION
-        SQLITE --> SPARSE --> FUSION
-        FUSION --> FILTER --> GROUP --> TOP5 --> EVIDENCE
-        EVIDENCE -->|"Không"| ABSTAIN --> SAVE
-        EVIDENCE -->|"Có"| CONTEXT --> ESCAPE --> PROMPT --> GEMMA --> CHECK
-        SQLITE --> CONTEXT
-        GEMMA -.->|"token events"| RESPONSE
-        CHECK --> SAVE
-        SAVE -->|"Có"| STORE["Lưu user + assistant vào SQLite"] --> RESPONSE
-        SAVE -->|"Client ngắt stream"| DISCARD["Không lưu assistant dang dở"]
-        STORE --> SQLITE
-    end
-
-    classDef storage fill:#e9f4ee,stroke:#176b47,color:#18221d;
-    classDef decision fill:#fff4d6,stroke:#a16a00,color:#18221d;
-    classDef model fill:#eee9fa,stroke:#6547a8,color:#18221d;
-    class SQLITE,CHROMA storage;
-    class VALIDATE,TEXT,REWRITE,EVIDENCE,SAVE,FILTER decision;
-    class EMBED,STANDALONE,GEMMA model;
+    Q["Question + hard caller scope"] --> VALIDATE["VALIDATE"]
+    VALIDATE --> PLAN["PLAN: strict QueryPlan"]
+    PLAN --> HYBRID["Hybrid: BM25 original/exact\n+ dense standalone"]
+    PLAN --> STRUCTURED["Structured Full Analysis"]
+    PLAN --> GSEARCH["Graph traversal ≤ 2 hop"]
+    SQLITE --> HYBRID
+    CHROMA --> HYBRID
+    SQLITE --> STRUCTURED
+    SQLITE --> GSEARCH
+    HYBRID --> UNION["True union + weighted RRF"]
+    GSEARCH --> UNION
+    UNION --> RERANK["BGE reranker: 40 → 12 child → 5 parent"]
+    STRUCTURED --> GRADE["Evidence grade"]
+    RERANK --> GRADE
+    GRADE -->|"insufficient, tối đa 1 lần"| CORRECT["CORRECT: bỏ soft hint, giữ hard scope"]
+    CORRECT --> HYBRID
+    GRADE --> GENERATE["Deterministic decision hoặc grounded generation"]
+    GENERATE --> VERIFY["Rule + claim/citation verifier"]
+    VERIFY -->|"fail, tối đa 1 lần"| GENERATE
+    VERIFY -->|"passed / qualified"| BUFFER["Buffer answer đã verify"]
+    VERIFY -->|"lần hai vẫn lỗi"| ABSTAIN["ABSTAIN, không citation"]
+    BUFFER --> OUT["JSON hoặc SSE\nmeta → token* → sources → done"]
+    ABSTAIN --> OUT
 ```
 
-Page parent/child thông thường không vượt ranh giới trang. Khi phát hiện câu đang
-dang dở hoặc header bảng lặp ở trang kế tiếp, ingestion bổ sung một bridge parent
-tối đa 2.400 ký tự, một boundary child nhìn thấy cả hai phía và các context child
-phủ toàn parent; mỗi child tối đa 600 ký tự. Nhờ đó truy vấn khớp phần dẫn ở trang
-trước vẫn nạp được toàn bộ phần tiếp nối ở trang sau. Nguồn bridge được citation
-theo khoảng như `trang 3–4`; chunk một trang vẫn giữ API `page` cũ. ID tài
-liệu/chunk được tạo xác định từ SHA-256, số trang và vị trí chunk; retry không tạo
-bản trùng. Lexical retrieval chỉ rerank parent đã vượt dense threshold, nên exact
-match không thể tự đưa một nguồn semantic yếu vào prompt.
+Page parent/child và bridge của PDF được giữ nguyên, không reindex vì các tính
+năng nâng cao. Hybrid mới là union thật: lexical-only candidate vẫn được vào
+reranker dù dense miss; trường citation `score` vẫn là dense relevance và bằng
+`0.0` cho nguồn lexical/graph-only. Graph chỉ được dựng từ daily digest và Full
+Analysis đang `ready`, mỗi assertion phải trỏ tới quote nguyên văn trong parent.
+Mọi graph path cuối cùng vẫn citation parent gốc, không citation graph ID hay
+`evidence_id` opaque.
+
+Mặc định toàn bộ reranker, Agentic, Self-check và GraphRAG đều tắt. Khi bật
+Self-check, answer được sinh và kiểm chứng toàn bộ trước khi server phát token;
+draft bị reject không bao giờ tới client. Luồng cũ và shape API cũ giữ nguyên khi
+`explain=false`.
 
 ## 1. Yêu cầu hệ thống
 
@@ -145,11 +100,13 @@ ollama pull gemma4:e2b
 ollama run gemma4:e2b "Trả lời đúng một từ: OK"
 ```
 
-Tải BGE-M3 vào Hugging Face cache:
+Tải embedding và reranker vào Hugging Face cache:
 
 ```bash
 HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python -c \
   'from sentence_transformers import SentenceTransformer; SentenceTransformer("BAAI/bge-m3"); print("BGE-M3 ready")'
+HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python -c \
+  'from sentence_transformers import CrossEncoder; CrossEncoder("BAAI/bge-reranker-v2-m3"); print("BGE reranker ready")'
 ```
 
 Cảnh báo về request chưa xác thực tới Hugging Face ở bước này chỉ liên quan đến
@@ -171,8 +128,8 @@ giữ tương thích cũ; API ingest digest nội bộ luôn yêu cầu Bearer t
 
 ### Chạy cùng GX Portfolio Intelligence bằng Docker
 
-Docker image vẫn chạy embedding hoàn toàn offline. Vì vậy phải tải BGE-M3 vào
-named volume một lần trước khi khởi động service. Từ thư mục
+Docker image vẫn chạy model retrieval hoàn toàn offline. Vì vậy phải tải BGE-M3
+và reranker vào named volume một lần trước khi khởi động service. Từ thư mục
 `gx.portfolio.intelligence`, với `RAG_SERVICE_API_KEY` đã được đặt trong
 deployment `.env`, chạy:
 
@@ -181,7 +138,7 @@ docker compose --profile service build simple-rag
 docker compose --profile service run --rm \
   -e HF_HUB_OFFLINE=0 -e TRANSFORMERS_OFFLINE=0 \
   simple-rag python -c \
-  'from sentence_transformers import SentenceTransformer; SentenceTransformer("BAAI/bge-m3"); print("BGE-M3 ready")'
+  'from sentence_transformers import SentenceTransformer, CrossEncoder; SentenceTransformer("BAAI/bge-m3"); CrossEncoder("BAAI/bge-reranker-v2-m3"); print("BGE models ready")'
 docker compose --profile service up -d --build
 ```
 
@@ -215,9 +172,11 @@ curl http://127.0.0.1:8000/api/health
 
 Health response hiển thị thêm `fts`, `fts_indexed_children`, embedding device,
 dimension, revision, số input từng bị tokenizer cắt và
-`full_report_payloads`. `status=degraded` thường có nghĩa Ollama chưa chạy,
-thiếu `gemma4:e2b`, một index local không sẵn sàng, hoặc report `ready` đang
-thiếu canonical payload/chunk decision đúng version.
+`full_report_payloads`; đồng thời có `reranker`, advanced flags, review model và
+`graph` coverage/backlog/failures/extractor fingerprint. `status=degraded`
+thường có nghĩa Ollama chưa chạy, thiếu model review/extractor, reranker đã bật
+nhưng chưa cache, một index local không sẵn sàng, hoặc report `ready` đang thiếu
+canonical payload/chunk decision đúng version.
 
 ## 5. CLI
 
@@ -266,6 +225,19 @@ Kết quả JSON luôn có `scanned/stored/partial/requeued/failed`. Ở `--dry-
 mở lại GX PI khi `failed=0`, rồi chờ các document `requeued` trở lại `ready`.
 Chạy lại sau khi indexing xong là no-op (`stored=0`, `requeued=0`).
 
+Lập kế hoạch hoặc dựng lại riêng evidence graph trong SQLite. Lệnh này không
+re-embed, không đổi Chroma fingerprint và không graph hóa PDF:
+
+```bash
+local-rag graph-reindex --dry-run
+local-rag graph-reindex --apply
+local-rag graph-reindex --apply --document-id doc_...
+```
+
+`--dry-run` chỉ liệt kê normalized daily digest/Full Analysis đủ điều kiện.
+`--apply` chạy tuần tự với concurrency 1; build lỗi vẫn để document nguồn ở
+trạng thái `ready` và graph routing sẽ fallback sang hybrid retrieval.
+
 Chạy bộ eval 30 câu local, gồm 10 câu khó về mã, số, thuật ngữ và Việt–Anh:
 
 ```bash
@@ -286,6 +258,61 @@ hybrid. Ngưỡng nghiệm thu được ghi ngay trong kết quả JSON.
 Bản baseline đã chạy trên toàn bộ hai PDF mẫu nằm tại `evals/baseline.json`;
 ground truth trang tương ứng nằm trong `evals/questions.jsonl`. Kết quả benchmark
 retrieval-only giúp quyết định bật hybrid nằm tại `evals/hybrid_retrieval.json`.
+
+Release gate cho Agentic + Self/CRAG + GraphRAG là một chế độ riêng, nên không
+thay đổi lệnh/bộ 30 câu ở trên. Validate golden JSONL nâng cao (tối thiểu 150 câu
+thực tế) mà không khởi động model:
+
+```bash
+python chatbot.py evaluate /path/advanced_questions.jsonl \
+  --release-gate --validate-only
+```
+
+Sau khi có trace đã gắn nhãn từ một lần chạy local, chấm toàn bộ quality gate và
+đồng thời kiểm tra bộ 30 câu không regression:
+
+```bash
+python chatbot.py evaluate /path/advanced_questions.jsonl \
+  --release-gate \
+  --results /path/advanced_results.jsonl \
+  --legacy-results /path/current_30_result.json \
+  --legacy-baseline evals/hybrid_full.json
+```
+
+`current_30_result.json` phải được tạo bằng evaluator hiện tại trên đúng
+`evals/questions.jsonl`; output có canonical `question_set_sha256` để ngăn so
+sánh nhầm bộ câu hỏi mà không phụ thuộc line ending. Gate này so sánh với baseline
+30 câu đã commit theo đúng chiều của từng
+metric (recall/citation/abstention/coverage không giảm, irrelevant citation không
+tăng, không phát sinh failed case ID mới), không áp các acceptance tuyệt đối mới
+lên một baseline lịch sử vốn chưa đạt chúng.
+
+Schema v1, quy tắc exact evidence span, trace format và toàn bộ ngưỡng release
+được mô tả tại [`evals/ADVANCED_RELEASE_GATE.md`](evals/ADVANCED_RELEASE_GATE.md).
+Repository cố ý không sinh 150 ground-truth case giả; corpus release phải được
+review trên dữ liệu thực tế trước khi bật bất kỳ advanced flag nào.
+
+### Rollout advanced RAG
+
+Pin `RAG_ADVANCED_ANSWER_NUM_PREDICT=1024` trước khi rollout. Sau khi đổi biến
+môi trường phải recreate container (không chỉ `docker compose restart`) và xác
+nhận `/api/health` trả `.advanced.answer_num_predict == 1024`.
+
+1. Dừng writer, snapshot toàn bộ `data/`, deploy schema v8 với mọi flag mới bằng
+   `0`, rồi xác nhận bộ test/eval cũ không regression.
+2. Preload reranker vào Hugging Face volume, bật `RAG_HYBRID_SEARCH=1` và
+   `RAG_RERANK_ENABLED=1` sau khi retrieval/rerank gate đạt.
+3. Bật `RAG_AGENTIC_ENABLED=1`; kiểm tra route accuracy và `scope_escapes=0`.
+4. Bật `RAG_SELF_CHECK_ENABLED=1`; xác nhận SSE chỉ phát answer đã verify và các
+   lỗi model/timeout/truncation không tạo history.
+5. Bật `RAG_GRAPH_BUILD_ENABLED=1`, chờ health graph coverage đạt mục tiêu, rồi
+   mới bật `RAG_GRAPH_ENABLED=1` cho relationship/multi-hop.
+
+Rollback token budget không cần restore hay reindex Chroma: đặt
+`RAG_ADVANCED_ANSWER_NUM_PREDICT=512` rồi recreate `simple-rag`. Với rollout
+feature, tắt flag của phase vừa bật và recreate service. Các graph table là
+derived data nên được giữ lại; chỉ restore toàn bộ snapshot nếu
+migration/storage chính gặp sự cố.
 
 ## REST API
 
@@ -409,6 +436,41 @@ curl -H "content-type: application/json" \
   http://127.0.0.1:8000/api/chat
 ```
 
+Khi cần metadata kiểm toán không chứa chain-of-thought, thêm `"explain":true`:
+
+```json
+{
+  "question": "HPG chịu tác động bởi rủi ro nào?",
+  "explain": true
+}
+```
+
+Response được cộng thêm trường sau; request cũ hoặc `explain=false` giữ nguyên
+contract:
+
+```json
+{
+  "rag": {
+    "strategy": "mixed",
+    "tools": ["hybrid", "graph"],
+    "corrective_rounds": 1,
+    "confidence": "medium",
+    "verification_status": "qualified",
+    "abstained": false
+  }
+}
+```
+
+Khi `explain=true`, từng citation có thể thêm `explain.retrieval` với rank/score
+dense, lexical, weighted RRF, reranker và graph. Các điểm này không xuất hiện ở
+request thường; `citation.score` vẫn chỉ là dense relevance (`0.0` cho nguồn
+lexical/graph-only).
+
+Với advanced RAG, SSE vẫn theo thứ tự
+`meta -> token* -> sources -> done|error`. Toàn bộ answer được buffer và verify
+trước khi token đầu tiên được phát; draft bị từ chối không tới client và không
+được lưu vào history.
+
 Giới hạn phạm vi tìm kiếm và tiếp tục một hội thoại:
 
 ```json
@@ -425,6 +487,15 @@ dùng 6 lượt gần nhất. Chỉ một generation chạy tại một thời �
 được lưu. Reasoning của model được tắt cho cả query rewrite và answer. Nếu Ollama
 kết thúc với `done_reason=length`, API trả mã `response_truncated` và cũng không
 lưu câu trả lời thiếu vào lịch sử.
+
+Nếu bước self-check gặp lỗi kỹ thuật, REST và SSE vẫn trả mã tổng quát
+`self_check_unavailable` và thêm `reason_code` an toàn để chẩn đoán, ví dụ
+`self_check_response_contract_invalid`, `self_check_response_parse_failed`,
+`self_check_response_truncated`, `self_check_source_scope_invalid`,
+`self_check_timeout` hoặc `self_check_execution_failed`. Giao diện hiển thị hai
+mã này dưới thông báo lỗi; server ghi cùng `reason_code` và `request_id` vào
+`data/logs/rag.jsonl`. Log không chứa câu hỏi, câu trả lời, evidence hoặc raw
+response của model.
 
 Mỗi citation luôn có `page` (trang bắt đầu, tương thích client cũ) và `page_end`.
 Với nguồn một trang hai giá trị bằng nhau; với bridge UI hiển thị khoảng trang.
@@ -456,9 +527,24 @@ Với nguồn một trang hai giá trị bằng nhau; với bridge UI hiển th�
 | `RAG_HYBRID_SEARCH` | `0`; đặt `1` để bật FTS5 + weighted RRF |
 | `RAG_PARENT_SEARCH_K` | `5` |
 | `RAG_RELEVANCE_THRESHOLD` | `0.35` |
+| `RAG_RERANK_ENABLED` | `0`; dùng BGE cross-encoder local và fail closed nếu model chưa cache |
+| `RAG_RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` |
+| `RAG_RERANK_CANDIDATE_K` / `CHILD_K` | `40` / `12` |
+| `RAG_RERANK_MIN_SCORE` | `0.5` |
+| `RAG_AGENTIC_ENABLED` | `0`; state machine bounded, yêu cầu hybrid + reranker |
+| `RAG_SELF_CHECK_ENABLED` | `0`; yêu cầu Agentic RAG |
+| `RAG_REVIEW_MODEL` | bằng `RAG_CHAT_MODEL` nếu không cấu hình |
+| `RAG_AGENT_TIMEOUT_SECONDS` | `120` |
+| `RAG_AGENT_MAX_RETRIEVAL_ROUNDS` / `MAX_SUBQUERIES` / `MAX_TOOL_CALLS` | `2` / `3` / `4` |
+| `RAG_SELF_CHECK_MAX_ANSWER_ATTEMPTS` | `2` |
+| `RAG_GRAPH_BUILD_ENABLED` | `0`; build graph SQLite cho normalized research |
+| `RAG_GRAPH_ENABLED` | `0`; routing graph yêu cầu Agentic + graph build |
+| `RAG_GRAPH_EXTRACTOR_MODEL` | bằng `RAG_REVIEW_MODEL` nếu không cấu hình |
+| `RAG_GRAPH_MAX_HOPS` / `WORKER_CONCURRENCY` | `2` / `1` |
 | `RAG_MAX_UPLOAD_BYTES` | `52428800` |
 | `RAG_MAX_PDF_PAGES` | `300` |
 | `RAG_ANSWER_NUM_PREDICT` | `2048` |
+| `RAG_ADVANCED_ANSWER_NUM_PREDICT` | `1024`; giới hạn riêng cho answer Agentic/Advanced RAG, hợp lệ `256..1024` |
 | `RAG_REWRITE_NUM_PREDICT` | `96` |
 | `RAG_SERVICE_API_KEY` | không có; bắt buộc trước khi dùng internal digest API |
 | `RAG_DIGEST_MAX_BATCH_SIZE` | `50` |
@@ -469,10 +555,11 @@ cấu hình cross-page và schema tạo thành index fingerprint. Khi chúng tha
 tài liệu `ready` được tự động đưa về hàng đợi và reindex vào collection mới. Sau
 lần nâng cấp schema cross-page này, các tài liệu cũ sẽ tự reindex đúng một lần.
 
-Hybrid retrieval đã qua retrieval-only gate nhưng full eval gần nhất chưa đạt
-citation/abstention gate, nên mặc định an toàn vẫn là dense-only. Có thể export
-`RAG_HYBRID_SEARCH=1` để thử nghiệm; xem `evals/hybrid_retrieval.json` và
-`evals/hybrid_full.json` trước khi bật cho dữ liệu production.
+Hybrid retrieval cũ đã qua retrieval-only gate nhưng full eval gần nhất chưa đạt
+citation/abstention gate. Vì vậy mọi flag mới vẫn mặc định tắt và chỉ được bật
+tuần tự sau release gate trên bộ ground truth tối thiểu 150 câu. Xem
+`evals/hybrid_retrieval.json`, `evals/hybrid_full.json` và phần rollout bên dưới
+trước khi bật cho dữ liệu production.
 
 ## Dữ liệu và backup
 
@@ -493,10 +580,11 @@ cp -a data "data-backup-$(date +%Y%m%d-%H%M%S)"
 Khôi phục bằng cách dừng server và thay toàn bộ `data/` bằng cùng một snapshot;
 không trộn SQLite của snapshot này với Chroma của snapshot khác.
 
-Structured log chỉ ghi event, request ID, thời gian, document/chunk ID, score và
-loại lỗi. Nội dung PDF/digest, raw evidence, câu hỏi và câu trả lời không được
-ghi log mặc định. Daily digest và Full Analysis không thể bị xóa qua public
-DELETE API.
+Structured log chỉ giữ event/request ID, stage/route/round, duration,
+candidate/source count, confidence bucket và reason code. Nội dung PDF/digest,
+raw evidence, câu hỏi, câu trả lời, entity label, graph content, document/chunk
+ID và score không được ghi log. Daily digest và Full Analysis không thể bị xóa
+qua public DELETE API.
 
 ## Kiểm thử
 
@@ -523,6 +611,9 @@ Test hiện bao phủ:
 - Bearer auth, logical upsert/stale update, seal invariant, provenance lịch sử,
   digest filters/citation và raw-field rejection;
 - đóng stream hoặc chạm giới hạn sinh không lưu assistant message thiếu.
+- true union/RRF và lexical rescue, fail-closed reranker, bounded Agentic/CRAG,
+  claim verification/abstention, buffered SSE, schema/GraphRAG 1–2 hop, stale
+  build, ambiguous alias, per-edge scope và advanced release-gate scoring.
 
 ## Chạy offline hoàn toàn
 
@@ -573,3 +664,4 @@ không tự OCR ảnh.
 - [FastAPI testing](https://fastapi.tiangolo.com/tutorial/testing/)
 - [Gemma 4 trên Ollama](https://ollama.com/library/gemma4)
 - [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3)
+- [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)

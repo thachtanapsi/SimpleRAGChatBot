@@ -12,14 +12,14 @@ from pathlib import Path
 _SAFE_FIELDS = (
     "event",
     "request_id",
-    "elapsed_ms",
-    "document_id",
-    "chunk_ids",
-    "score",
-    "fusion_score",
-    "count",
-    "cross_page_bridges",
-    "error",
+    "stage",
+    "route",
+    "round",
+    "duration_ms",
+    "candidate_count",
+    "source_count",
+    "confidence_bucket",
+    "reason_code",
 )
 
 
@@ -33,8 +33,8 @@ class PrivacyJsonFormatter(logging.Formatter):
             value = getattr(record, field, None)
             if value is not None:
                 payload[field] = value
-        if record.exc_info and "error" not in payload:
-            payload["error"] = record.exc_info[0].__name__
+        if record.exc_info and "reason_code" not in payload:
+            payload["reason_code"] = record.exc_info[0].__name__
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 

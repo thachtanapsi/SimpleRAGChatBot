@@ -41,6 +41,74 @@ class ServiceUnavailableError(RAGError):
     status_code = 503
 
 
+class AgentTimeoutError(ServiceUnavailableError):
+    error_code = "agent_timeout"
+
+    def __init__(self):
+        super().__init__(
+            "Luồng RAG nâng cao đã hết thời gian xử lý; kết quả chưa được lưu."
+        )
+
+
+class RetrievalToolsUnavailableError(ServiceUnavailableError):
+    error_code = "retrieval_tools_unavailable"
+
+    def __init__(self):
+        super().__init__(
+            "Các công cụ truy xuất cục bộ tạm thời không khả dụng; kết quả chưa được lưu."
+        )
+
+
+class SelfCheckUnavailableError(ServiceUnavailableError):
+    error_code = "self_check_unavailable"
+
+    _REASON_MESSAGES = {
+        "self_check_response_truncated": (
+            "Phản hồi của model kiểm chứng bị cắt trước khi hoàn tất; "
+            "kết quả chưa được lưu."
+        ),
+        "self_check_response_parse_failed": (
+            "Không đọc được JSON do model kiểm chứng trả về; "
+            "kết quả chưa được lưu."
+        ),
+        "self_check_response_contract_invalid": (
+            "Kết quả của model kiểm chứng không đúng cấu trúc bắt buộc; "
+            "kết quả chưa được lưu."
+        ),
+        "self_check_source_scope_invalid": (
+            "Model kiểm chứng tham chiếu nguồn ngoài tập bằng chứng; "
+            "kết quả chưa được lưu."
+        ),
+        "self_check_timeout": (
+            "Bước kiểm chứng đã hết thời gian xử lý; kết quả chưa được lưu."
+        ),
+        "self_check_execution_failed": (
+            "Bước kiểm chứng gặp lỗi kỹ thuật; kết quả chưa được lưu."
+        ),
+    }
+
+    def __init__(self, reason_code: str | None = None):
+        if reason_code is not None and reason_code not in self._REASON_MESSAGES:
+            raise ValueError("unsupported self-check reason code")
+        self.reason_code = reason_code
+        super().__init__(
+            self._REASON_MESSAGES.get(
+                reason_code,
+                "Model kiểm chứng cục bộ tạm thời không khả dụng; "
+                "kết quả chưa được lưu.",
+            )
+        )
+
+
+class ReviewModelUnavailableError(ServiceUnavailableError):
+    error_code = "rag_review_model_unavailable"
+
+    def __init__(self):
+        super().__init__(
+            "Model planner/grader cục bộ tạm thời không khả dụng; kết quả chưa được lưu."
+        )
+
+
 class GenerationTruncatedError(ServiceUnavailableError):
     """Ollama stopped because the configured generation limit was reached."""
 

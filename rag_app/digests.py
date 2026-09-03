@@ -204,6 +204,66 @@ def _claim_text(claim: Mapping[str, Any]) -> str:
     return f"- {text}{suffix}"
 
 
+def normalise_section_claims(value: Any) -> tuple[dict[str, Any], ...]:
+    """Keep the allowed claim shape alongside the rendered section text.
+
+    Daily digests historically flattened claims into Markdown before storage.
+    GraphRAG needs the typed claim boundaries, but must not persist arbitrary
+    producer fields.  This helper mirrors :func:`render_section`'s allowlist and
+    returns immutable, JSON-safe records for the relational claim table.
+    """
+
+    raw_claims: Any
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        raw_claims = value
+    elif isinstance(value, Mapping):
+        raw_claims = value.get("claims") or []
+    else:
+        return ()
+    if not isinstance(raw_claims, Sequence) or isinstance(
+        raw_claims, (str, bytes, bytearray)
+    ):
+        raise ValidationError("claims phải là danh sách")
+
+    claims: list[dict[str, Any]] = []
+    for raw in raw_claims:
+        if not isinstance(raw, Mapping):
+            raise ValidationError("Digest claim không hợp lệ")
+        if set(raw) - {"text", "confidence", "evidence_ids"}:
+            raise ValidationError("Digest claim chứa trường không được phép")
+        text = str(raw.get("text") or "").strip()
+        if not text:
+            continue
+        confidence = raw.get("confidence")
+        if confidence is not None and (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (str, int, float))
+        ):
+            raise ValidationError("confidence của claim không hợp lệ")
+        raw_evidence_ids = raw.get("evidence_ids") or []
+        if not isinstance(raw_evidence_ids, Sequence) or isinstance(
+            raw_evidence_ids, (str, bytes, bytearray)
+        ):
+            raise ValidationError("evidence_ids của claim phải là danh sách")
+        evidence_ids = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in raw_evidence_ids
+                if str(item).strip()
+            )
+        )
+        claims.append(
+            {
+                "text": text,
+                "confidence": confidence,
+                "evidence_ids": evidence_ids,
+            }
+        )
+    return tuple(claims)
+
+
 def render_section(value: Any) -> str:
     """Render only the explicitly allowed digest/claim shape.
 
@@ -272,6 +332,7 @@ class CanonicalDigest:
     stage_status: dict[str, str]
     stage_fingerprints: dict[str, str]
     sections: dict[str, str]
+    claims: dict[str, tuple[dict[str, Any], ...]]
     section_statuses: dict[str, str]
     section_stages: dict[str, str]
     content_sha256: str
@@ -331,6 +392,10 @@ def canonicalise_digest(
         raise ValidationError("sections phải có đúng 9 mục daily digest")
     sections = {
         section: render_section(raw_sections[section])
+        for section in DIGEST_SECTION_ORDER
+    }
+    claims = {
+        section: normalise_section_claims(raw_sections[section])
         for section in DIGEST_SECTION_ORDER
     }
     if not any(sections.values()):
@@ -410,6 +475,7 @@ def canonicalise_digest(
         stage_status={},
         stage_fingerprints={},
         sections=sections,
+        claims=claims,
         section_statuses={
             section: "complete" if text else "unavailable"
             for section, text in sections.items()
