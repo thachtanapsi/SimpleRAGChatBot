@@ -15,6 +15,7 @@ from rag_app.orchestration import (
     AdaptiveEvidenceGrader,
     AdaptiveQueryPlanner,
     AgenticOrchestrator,
+    ConversationTurn,
     DeterministicDecision,
     EvidenceGrade,
     EvidenceView,
@@ -314,6 +315,148 @@ async def test_adaptive_planner_uses_exact_ready_ticker_without_model_call():
     assert corrected.ticker == "HPG"
     assert corrected.section == "risks_unknowns"
     assert delegate.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("question", "ticker"),
+    [
+        ("thông tin giá POW", "POW"),
+        ("Giá cổ phiếu HPG hiện tại?", "HPG"),
+        ("giá FPT là bao nhiêu?", "FPT"),
+        ("POW giá bao nhiêu?", "POW"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_simple_price_lookup_uses_one_query_despite_unrelated_history(question, ticker):
+    delegate = UnexpectedPlanner()
+    planner = AdaptiveQueryPlanner(delegate, lambda: ["POW", "HPG", "FPT"])
+
+    result = await planner.plan(
+        PlanningRequest(
+            question=question,
+            history=[
+                ConversationTurn(role="user", content="tóm tắt vẻ đẹp phú yên"),
+                ConversationTurn(role="assistant", content="Phú Yên có nhiều cảnh đẹp [1]."),
+            ],
+            allowed_tools=["hybrid", "structured", "graph"],
+        )
+    )
+
+    assert result.standalone_query == question
+    assert result.intent == "lookup"
+    assert result.routes == ["hybrid"]
+    assert result.subqueries == []
+    assert result.ticker == ticker
+    assert result.section is None
+    assert result.latest_only is True
+    assert result.required_facets == ["giá"]
+    assert result.exact_terms == [ticker, "giá"]
+    assert delegate.calls == 0
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "giá POW ngày 26/08/2026",
+        "giá POW trong tháng trước",
+        "dự báo giá POW tuần tới",
+        "so sánh giá POW và FPT",
+        "giá POW và VNM",
+        "đánh giá POW",
+        "giá của mã đó",
+        "thông tin giá UNKNOWN",
+    ],
+)
+@pytest.mark.asyncio
+async def test_price_shortcut_delegates_questions_needing_more_planning(question):
+    expected = plan(standalone_query=question)
+    model = StructuredReviewModel(expected.model_dump(mode="json"))
+    planner = AdaptiveQueryPlanner(LLMQueryPlanner(model), lambda: ["POW", "FPT"])
+
+    result = await planner.plan(
+        PlanningRequest(question=question, history=[], allowed_tools=["hybrid"])
+    )
+
+    assert model.messages is not None
+    assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_price_lookup_can_use_semantic_correction_when_evidence_is_missing():
+    delegate = UnexpectedPlanner()
+    planner = AdaptiveQueryPlanner(delegate, lambda: ["POW"])
+
+    result = await planner.correct(
+        PlanningRequest(
+            question="thông tin giá POW",
+            history=[],
+            allowed_tools=["hybrid"],
+            correction_round=1,
+            prior_grade="insufficient",
+        )
+    )
+
+    assert result == plan()
+    assert delegate.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_price_lookup_keeps_budget_for_grading_generation_and_verification():
+    # The live planner produced these equivalent searches for this question
+    # after a Phu Yen exchange. Each search reranks the same corpus on CPU.
+    model = StructuredReviewModel(
+        plan(
+            standalone_query="giá POW",
+            subqueries=["điều tra giá hiện tại của POW"],
+            ticker=None,
+            exact_terms=["POW"],
+            required_facets=[],
+        ).model_dump(mode="json")
+    )
+    price_text = "POW đóng cửa ở mức 13,300 VND ngày 26/08/2026."
+
+    class PriceTool(RecordingTool):
+        async def retrieve(self, request):
+            await asyncio.sleep(0.55)
+            return await super().retrieve(request)
+
+    class PriceGrader:
+        async def grade(self, request):
+            await asyncio.sleep(0.2)
+            assert request.evidence[0].text == price_text
+            return EvidenceGrade(verdict="sufficient", reason="price_found", suggested_queries=[])
+
+    async def generate_price(_question, _sources, _feedback):
+        await asyncio.sleep(0.55)
+        return GeneratedAnswer(
+            answer=f"{price_text} [1]",
+            claims=[{"text": price_text, "citation_ids": ["1"]}],
+        )
+
+    tool = PriceTool(outputs=[source(text=price_text)])
+    selected_scope = RequestScope.from_request(["doc1"], document_ids_explicit=True)
+    result = await AgenticOrchestrator(
+        [tool],
+        planner=AdaptiveQueryPlanner(LLMQueryPlanner(model), lambda: ["POW"]),
+        grader=PriceGrader(),
+        timeout_seconds=1.5,
+    ).run(
+        question="thông tin giá POW",
+        scope=selected_scope,
+        history=[{"role": "user", "content": "tóm tắt vẻ đẹp phú yên"}],
+        generate=generate_price,
+        verify=verify,
+        abstention="insufficient",
+    )
+
+    assert result.abstained is False
+    assert result.answer == f"{price_text} [1]"
+    assert len(tool.requests) == 1
+    assert tool.requests[0].scope == selected_scope
+    assert tool.requests[0].soft_filters.latest_only is False
+    assert [event.stage for event in result.events] == [
+        "validate", "plan", "retrieve", "grade", "generate", "verify", "finalize"
+    ]
 
 
 @pytest.mark.asyncio

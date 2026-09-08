@@ -769,13 +769,33 @@ class AdaptiveQueryPlanner:
         ]
         decision_query = bool(DECISION_QUERY_RE.search(question))
         risk_query = facets == ["rủi ro"]
+        # A self-contained price lookup needs one hybrid search. Letting the
+        # model expand it into equivalent subqueries repeats CPU reranking and
+        # can exhaust the deadline before generation and verification run.
+        # Match the whole question so forecasts, comparisons, dates and extra
+        # facets still receive semantic planning.
+        ticker_pattern = re.escape(mentioned[0])
+        price_query = bool(
+            re.fullmatch(
+                rf"(?:(?:thông\s+tin(?:\s+về)?\s+)?giá\s+"
+                rf"(?:(?:cổ\s+phiếu|mã)\s+)?{ticker_pattern}|{ticker_pattern}\s+giá)"
+                r"(?:\s+(?:hiện\s+tại|mới\s+nhất|gần\s+nhất))?"
+                r"(?:\s+(?:là\s+)?bao\s+nhiêu)?\s*\??",
+                question,
+                flags=re.IGNORECASE,
+            )
+        )
+        if price_query:
+            if request.correction_round or "hybrid" not in request.allowed_tools:
+                return None
+            facets = ["giá"]
         if (
             COMPARISON_QUERY_RE.search(question)
             or HISTORICAL_QUERY_RE.search(question)
             or SQL_QUERY_RE.search(question)
             or "```" in question
             or re.search(r"<\s*(?:system|assistant|tool)\b", question, re.IGNORECASE)
-            or (not decision_query and not risk_query)
+            or (not decision_query and not risk_query and not price_query)
         ):
             return None
 
