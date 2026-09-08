@@ -17,6 +17,7 @@ from rag_app.evaluation import is_abstention, page_range_matches, percentile_95
 from rag_app.orchestration import AgenticResult, OrchestrationExplanation
 from rag_app.reranking import RerankResult, RerankerUnavailableError
 from rag_app.retrieval import ParentChildRetriever, RetrievedSource, format_context
+from rag_app.self_check import SelfCheckService, VerificationReport, audit_generated_answer
 
 
 def source(source_id="1"):
@@ -591,6 +592,109 @@ async def test_advanced_generator_uses_raw_structured_output(settings):
     assert result.answer == "Evidence is available [1]."
     assert llm.structured_call["method"] == "json_schema"
     assert llm.structured_call["include_raw"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("extra_verified_source", [False, True])
+async def test_advanced_pdf_summary_restores_missing_inline_citations(
+    settings, streaming, extra_verified_source
+):
+    question = "tóm tắt vẻ đẹp phú yên"
+    claim_text = "Vẻ đẹp của Phú Yên đến từ biển rộng, đồng xanh và núi thấp."
+    pdf_source = replace(source(), filename="Ve_dep_Phu_Yen.pdf", text=claim_text)
+    sources = [pdf_source]
+    supported_ids = ["1"]
+    if extra_verified_source:
+        sources.append(replace(pdf_source, id="2", parent_id="p2", page=4))
+        supported_ids.append("2")
+    storage = ChatStorage()
+    verified = []
+
+    class Verifier:
+        async def verify(self, request):
+            verified.append(request)
+            return VerificationReport(passed=True, supported_citation_ids=supported_ids)
+
+    llm = StructuredAnswerLLM(
+        {
+            "raw": AIMessage(content="", response_metadata={"done_reason": "stop"}),
+            "parsed": {
+                "answer": "Phú Yên có cảnh quan đa dạng và không khí bình yên.",
+                "claims": [{"text": claim_text, "citation_ids": ["1"]}],
+            },
+            "parsing_error": None,
+        }
+    )
+    service = ChatService(
+        replace(settings, agentic_enabled=True, self_check_enabled=True),
+        storage,
+        FakeRetriever(sources),
+        llm,
+        asyncio.Semaphore(1),
+        self_checker=SelfCheckService(Verifier()),
+    )
+
+    if streaming:
+        events = [
+            event async for event in service.stream(question, "session", explain=True)
+        ]
+        result = events[-1]["data"]
+        assert [event["event"] for event in events] == ["meta", "token", "sources", "done"]
+        assert events[1]["data"]["text"] == result["answer"]
+        citations = events[2]["data"]["citations"]
+    else:
+        result = await service.answer(question, "session", explain=True)
+        citations = result["citations"]
+
+    assert result["rag"]["abstained"] is False
+    assert result["rag"]["verification_status"] == "passed"
+    assert result["answer"] == f"{claim_text} [1]"
+    assert citations[0]["filename"] == "Ve_dep_Phu_Yen.pdf"
+    assert citations[0]["cited"] is True
+    if extra_verified_source:
+        assert citations[1]["cited"] is False
+    assert len(verified) == 1
+    assert verified[0].generated.answer == result["answer"]
+    assert storage.exchanges == [("session", question, result["answer"])]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer_text", "claim_text", "citation_ids", "issue_code"),
+    [
+        ("Phú Yên có biển xanh.", "Phú Yên có biển xanh.", ["99"], "invalid_citation"),
+        ("Phú Yên có 99 bãi biển.", "Phú Yên có 99 bãi biển.", ["1"], "unsupported_number"),
+        ("Phú Yên có 99 bãi biển.", "Phú Yên có biển xanh.", ["1"], "unmapped_number"),
+        ("Phú Yên có biển xanh [99].", "Phú Yên có biển xanh.", ["1"], "invalid_citation"),
+    ],
+)
+async def test_missing_citation_recovery_keeps_other_verification_failures(
+    settings, answer_text, claim_text, citation_ids, issue_code
+):
+    llm = StructuredAnswerLLM(
+        {
+            "answer": answer_text,
+            "claims": [{"text": claim_text, "citation_ids": citation_ids}],
+        }
+    )
+    sources = [replace(source(), text="Phú Yên có biển xanh.")]
+    service = ChatService(
+        replace(settings, agentic_enabled=True),
+        ChatStorage(),
+        FakeRetriever(sources),
+        llm,
+        asyncio.Semaphore(1),
+    )
+
+    generated = await service._generate_advanced_answer(
+        "tóm tắt vẻ đẹp phú yên", sources, None
+    )
+    report = audit_generated_answer(generated, sources)
+
+    assert generated.answer == answer_text
+    assert report.passed is False
+    assert issue_code in {issue.code for issue in report.issues}
 
 
 @pytest.mark.asyncio

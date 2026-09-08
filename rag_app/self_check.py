@@ -567,7 +567,10 @@ class SelfCheckService:
             for claim in request.generated.claims
             for citation_id in claim.citation_ids
         }
-        if report.passed and set(report.supported_citation_ids) != expected_ids:
+        # The verifier may also confirm retrieved sources that the answer did
+        # not cite. Every claim citation must be supported; extras were already
+        # checked against the request's source scope above.
+        if report.passed and not expected_ids.issubset(report.supported_citation_ids):
             return VerificationReport(
                 passed=False,
                 issues=[

@@ -26,6 +26,7 @@ from .self_check import (
     OLLAMA_GENERATED_ANSWER_SCHEMA,
     SelfCheckService,
     VerificationReport,
+    audit_generated_answer,
     parse_generated_answer,
     unwrap_ollama_structured_output,
     with_ollama_json_schema,
@@ -344,7 +345,26 @@ class ChatService:
         parsed, raw_message, parsing_error = unwrap_ollama_structured_output(result)
         if generation_was_truncated(raw_message, self.advanced_answer_num_predict):
             raise GenerationTruncatedError(self.advanced_answer_num_predict)
-        return parse_generated_answer(None if parsing_error is not None else parsed)
+        generated = parse_generated_answer(None if parsing_error is not None else parsed)
+        if not CITATION_RE.search(generated.answer):
+            report = audit_generated_answer(generated, sources)
+            if report.issues and all(
+                issue.code == "missing_citation" for issue in report.issues
+            ):
+                # Some models supply cited claims but omit inline citations in
+                # their summary. Render those claims instead of attaching
+                # sources to unverified prose. The normal self-check still
+                # audits and semantically verifies this complete answer.
+                generated = parse_generated_answer(
+                    {
+                        "answer": "\n\n".join(
+                            f"{claim.text} [{', '.join(claim.citation_ids)}]"
+                            for claim in generated.claims
+                        ),
+                        "claims": [claim.model_dump() for claim in generated.claims],
+                    }
+                )
+        return generated
 
     async def _verify_advanced_answer(
         self,
